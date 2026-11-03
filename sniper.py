@@ -130,11 +130,20 @@ class Loc:
 SM = None          # source manager, set in main(); used to recover text for nodes without syntax
 
 
+# comments, whitespace and preprocessor directives that str(syntax) carries as the first token's trivia
+LEADING_TRIVIA = re.compile(r'(?:\s+|//[^\n]*|/\*.*?\*/|`(?:ifdef|ifndef|elsif|else|endif|define|undef|include|'
+                            r'timescale|line|pragma|resetall|default_nettype|celldefine|endcelldefine)\b[^\n]*)*',
+                            re.S)
+
+
 def text(node, limit=300):
     """Source text of a node, whitespace-collapsed. Elaborated nodes created by slang (implicit
     conversions, folded constants) have no syntax, so fall back to slicing the source buffer."""
     syn = getattr(node, 'syntax', None)
-    s = ' '.join(str(syn).split()) if syn is not None else ''
+    s = ''
+    if syn is not None:
+        s = str(syn)
+        s = ' '.join(s[LEADING_TRIVIA.match(s).end():].split())
     if not s and SM is not None:
         rng = getattr(node, 'sourceRange', None)
         try:
@@ -175,6 +184,7 @@ NODE_BASES = tuple(getattr(A, n) for n in
                    ('Expression', 'Statement', 'TimingControl', 'Constraint', 'AssertionExpr',
                     'Pattern', 'BinsSelectExpr') if hasattr(A, n))
 BASE_ATTRS = {b: set(dir(b)) for b in NODE_BASES}
+LITERALS = ('IntegerLiteral', 'StringLiteral', 'RealLiteral', 'UnbasedUnsizedIntegerLiteral', 'TimeLiteral')
 SKIP = {'syntax', 'sourceRange', 'bad', 'kind', 'compilation', 'parentScope', 'declaringDefinition',
         'eval', 'evalLValue', 'visit', 'check', 'isEquivalentTo', 'getSymbolReference',
         'effectiveWidth', 'hasHierarchicalReference', 'isImplicitString', 'isImplicitlyAssignableTo',
@@ -211,6 +221,8 @@ class Ser:
             rng = n.syntax.sourceRange
         if rng is not None and (top or not is_expr):
             sp = self.loc.span(rng)
+            if not sp['start'] and getattr(n, 'syntax', None) is not None:   # invalid nodes: empty range
+                sp = self.loc.span(n.syntax.sourceRange)
             out['line'] = sp['start']
             if sp['end'] != sp['start']: out['end'] = sp['end']
             if 'macro' in sp: out['macro'] = sp['macro']
@@ -219,9 +231,13 @@ class Ser:
             try: out['ty'] = str(n.type)
             except Exception: pass
             c = const_str(n)
-            if c is not None: out['const'] = c
-            if n.kind.name in ('IntegerLiteral', 'StringLiteral', 'RealLiteral', 'UnbasedUnsizedIntegerLiteral'):
+            if n.kind.name in LITERALS:
+                if c is None:       # not folded outside a full expression (dist weights, ...)
+                    try: c = str(n.value)
+                    except Exception: c = text(n)
+                out['const'] = c
                 return out          # 'const' carries the value; the raw literal object adds nothing
+            if c is not None: out['const'] = c
         for a in sorted(set(dir(type(n))) - BASE_ATTRS[base] - SKIP):
             if a.startswith('_') or a[0].isupper(): continue
             try: v = getattr(n, a)
@@ -249,7 +265,8 @@ class Ser:
         seen = seen | {id(v)}
         fields = {}
         for a in dir(v):
-            if a.startswith('_') or a in SKIP or a[0].isupper(): continue
+            # 'kind' is a field worth keeping on helper structs (DistWeight := vs :/, ...)
+            if a.startswith('_') or (a in SKIP and a != 'kind') or a[0].isupper(): continue
             try: x = getattr(v, a)
             except Exception: continue
             if callable(x) and not isinstance(x, NODE_BASES): continue
@@ -313,21 +330,27 @@ def classify_ref(e):
         try: ty = node.type
         except Exception: continue
         if is_vif_type(ty):
-            return {'what': 'vif', 'handle': '.'.join([s.name] + chain[:i]),
-                    'iface': str(ty).replace('virtual ', '', 1).split('.')[0],
-                    'signal': '.'.join(chain[i:])}
-    if chain and sk == 'ClassProperty':
+            itype = str(ty).replace('virtual ', '', 1)        # ifc#(P=1,...).modport
+            name, _, params = itype.partition('#')
+            r = {'what': 'vif', 'handle': '.'.join([s.name] + chain[:i]),
+                 'iface': name.split('.')[0], 'signal': '.'.join(chain[i:])}
+            if params: r['iface_params'] = params
+            return r
+    # a member access goes through a handle only when the object is a class (not a struct/union)
+    def is_cls(x):
+        try: return bool(x.type.isClass)
+        except Exception: return False
+    via = any(is_cls(node.value) for node, _ in nodes)
+    if chain and sk == 'ClassProperty' and via:
         return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': chain[-1], 'via_handle': True}
-    if sk == 'ClassProperty':
-        return {'what': 'field', 'path': s.name, 'field': s.name, 'via_handle': False}
+    if sk == 'ClassProperty':              # own property, or a member of an own struct property
+        return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': s.name, 'via_handle': False}
     if sk in ('Variable', 'Net') and root.kind.name == 'HierarchicalValue':
         return {'what': 'signal', 'path': text(e)}
-    if chain and sk in ('Variable', 'FormalArgument'):
-        try: is_cls = root.type.isClass
-        except Exception: is_cls = False
-        if is_cls:                         # req.mem_id = id : write through a local/argument handle
-            return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': chain[-1], 'via_handle': True,
-                    'handle_kind': 'local' if sk == 'Variable' else 'arg'}
+    if chain and sk in ('Variable', 'FormalArgument') and via:
+        # req.mem_id = id : write through a local/argument handle
+        return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': chain[-1], 'via_handle': True,
+                'handle_kind': 'local' if sk == 'Variable' else 'arg'}
     if sk in ('Variable', 'Net'):
         try: procedural = s.parentScope.isProceduralContext
         except Exception: procedural = False
@@ -335,8 +358,28 @@ def classify_ref(e):
                 'path': s.name + ('.' + '.'.join(chain) if chain else '')}
     if sk == 'FormalArgument':
         return {'what': 'arg', 'path': '.'.join([s.name] + chain), 'field': chain[-1] if chain else None,
-                'via_handle': bool(chain)}
+                'via_handle': False}
     return None
+
+
+def uninstantiated(sym):
+    """True for code in a scope slang did not elaborate (a generate branch not taken, ...)."""
+    try: return bool(sym.parentScope.isUninstantiated)
+    except Exception: return False
+
+
+def invalid_nodes(d, out=None):
+    """Code slang could not bind (an error in meta.diagnostics), found in a serialized body. The
+    visitor does not enter these subtrees, so nothing inside them appears in the facts."""
+    out = [] if out is None else out
+    if isinstance(d, dict):
+        if d.get('k') == 'Invalid':
+            out.append({'line': d.get('line'), 'src': d.get('src')})
+            return out
+        for v in d.values(): invalid_nodes(v, out)
+    elif isinstance(d, list):
+        for v in d: invalid_nodes(v, out)
+    return out
 
 
 def analyse(body, loc, ser):
@@ -647,15 +690,22 @@ class Extractor:
             elif k == 'GenericClassDef':
                 self.seen.add(key)
             elif k == 'Subroutine' and s.syntax is not None:
-                if key not in self.seen:
-                    self.seen.add(key); self.sub_syms.append(s)
+                keep(self.sub_syms, key, s)
             elif k == 'ProceduralBlock':
-                if key not in self.seen:
-                    self.seen.add(key); self.proc_syms.append(s)
+                keep(self.proc_syms, key, s)
             elif k == 'CovergroupType':
-                if key not in self.seen:
-                    self.seen.add(key); self.covergroups.append(s)
+                keep(self.covergroups, key, s)
             return A.VisitAction.Advance
+
+        first = {}
+
+        def keep(lst, key, s):
+            # one entry per source construct (generate loops, binds and classes repeat them); an
+            # elaborated copy wins over one in an uninstantiated scope (a bind into an inactive branch)
+            if key not in first:
+                first[key] = len(lst); lst.append(s)
+            elif uninstantiated(lst[first[key]]) and not uninstantiated(s):
+                lst[first[key]] = s
         root.visit(visit)
 
     # ---- types
@@ -763,17 +813,25 @@ class Extractor:
                'args': [{'name': a.name, 'dir': enum_name(a.direction), 'type': str(a.type),
                          'default': text(a.defaultValue) if getattr(a, 'defaultValue', None) is not None else None}
                         for a in s.arguments]}
-        if not ent['macro_generated']:
+        if uninstantiated(s):
+            ent['uninstantiated'] = True
+        elif not ent['macro_generated']:
             ent['facts'] = analyse(s.body, self.loc, self.ser)
             ent['body'] = self.ser.node(s.body) if s.body is not None else None
+            ent['facts']['invalid'] = invalid_nodes(ent['body'])
         return ent
 
     def proc_entry(self, s):
         sp = self.span(s)
         try: scope = s.parentScope.containingInstance.hierarchicalPath
         except Exception: scope = ''
-        return {'procedure': enum_name(s.procedureKind), 'scope': scope, **sp,
-                'facts': analyse(s.body, self.loc, self.ser), 'body': self.ser.node(s.body)}
+        ent = {'procedure': enum_name(s.procedureKind), 'scope': scope, **sp}
+        if uninstantiated(s):           # e.g. inside a generate-if whose condition is false: not bound
+            return {**ent, 'uninstantiated': True, 'facts': {**analyse(None, self.loc, self.ser), 'invalid': []}}
+        body = self.ser.node(s.body)
+        facts = analyse(s.body, self.loc, self.ser)
+        facts['invalid'] = invalid_nodes(body)
+        return {**ent, 'facts': facts, 'body': body}
 
     # ---- coverage
     def covergroup_entry(self, cg):
@@ -781,7 +839,8 @@ class Extractor:
         name = cg.name                      # the covergroup type symbol is anonymous; the name is in the syntax
         if not name and cg.syntax is not None and getattr(cg.syntax, 'name', None) is not None:
             name = str(cg.syntax.name).strip()
-        ent = {'name': name, 'path': cg.hierarchicalPath, **sp, 'sample_event': None,
+        ent = {'name': name, 'path': cg.hierarchicalPath, **sp, 'uninstantiated': uninstantiated(cg),
+               'sample_event': None,
                'sample_args': [], 'options': [], 'coverpoints': [], 'crosses': []}
         syn = cg.syntax
         if syn is not None:
@@ -819,7 +878,8 @@ class Extractor:
         if vals:
             def one(v):
                 while v.kind.name == 'Conversion': v = v.operand
-                if v.kind.name == 'ValueRange': return [const_str(v.left), const_str(v.right)]
+                if v.kind.name == 'ValueRange':      # '$' (unbounded) is not a constant
+                    return [const_str(v.left) or text(v.left), const_str(v.right) or text(v.right)]
                 return const_str(v) or text(v)
             e['ranges'] = [one(v) for v in vals]
         if '=>' in e['src']: e['transition'] = True
@@ -859,9 +919,9 @@ class Extractor:
                                 'ast': self.ser.node(x)})
             walk(body, fn)
         for s in procs:
-            if s.body is not None: collect(s.body, {'in': 'procedure'})
+            if s.body is not None and not uninstantiated(s): collect(s.body, {'in': 'procedure'})
         for s in subs:
-            if s.body is not None: collect(s.body, {'in': s.hierarchicalPath})
+            if s.body is not None and not uninstantiated(s): collect(s.body, {'in': s.hierarchicalPath})
         return out
 
     def counter_coverage(self, class_ents, sub_syms):
@@ -1114,7 +1174,9 @@ def main():
                        'covergroups': len(data['coverage']['covergroups']),
                        'assertions': len(data['coverage']['assertions']),
                        'counter_coverage_classes': len(data['coverage']['counter_coverage_heuristic']),
-                       'config_overrides': len(data['config']['overrides'])}}
+                       'config_overrides': len(data['config']['overrides']),
+                       'invalid_code': sum(len(x.get('facts', {}).get('invalid', []))
+                                           for x in subs + data['procedures'])}}
     out = {'meta': meta, **data}
     with open(a.output, 'w') as f:
         json.dump(out, f, indent=1, default=str)

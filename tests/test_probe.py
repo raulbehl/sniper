@@ -9,10 +9,10 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
 
 
-def run_probe():
+def run_probe(src='probe_tb.sv', top='probe_top'):
     out = os.path.join(tempfile.mkdtemp(), 'probe.json')
     subprocess.run([sys.executable, os.path.join(ROOT, 'sniper.py'), '--own', HERE, '-o', out, '--',
-                    '--top', 'probe_top', os.path.join(HERE, 'probe_tb.sv')], check=True, capture_output=True)
+                    '--top', top, os.path.join(HERE, src)], check=True, capture_output=True)
     with open(out) as f:
         return json.load(f)
 
@@ -84,6 +84,33 @@ def test_probe():
     assert {c['port']: c['expr'] for c in kids['dut']['connections']}['valid'] == 'pif.valid'
 
 
+def test_corpus_regressions():
+    """Constructs from real testbenches: see tests/probe_corpus.sv."""
+    d = run_probe('probe_corpus.sv', 'corpus_top')
+    assert d['meta']['errors'] == 0 and d['meta']['counts']['invalid_code'] == 0
+
+    # dist weights keep their value and := / :/ kind (slang does not fold weight expressions)
+    it = next(c for c in d['classes'] if c['name'] == 'item')
+    w = [(i['weight']['expr']['const'], i['weight']['kind']) for i in it['constraints'][0]['items'][0]['expr']['items']]
+    assert w == [('1', 'PerRange'), ('4', 'PerRange'), ('2', 'PerValue')]
+    # an unbounded '$' bin bound is kept
+    assert d['coverage']['covergroups'][0]['coverpoints'][0]['bins'][0]['ranges'] == [["8'd128", '$']]
+
+    subs = {s['name']: s for s in d['subroutines']}
+    run = subs['run']['facts']
+    # a leading comment is not part of a node's source text
+    assert [(r['target'], r['src']) for r in run['rand_sites']] == [('this', 'this.randomize()')]
+    # a parameterized interface is named without its parameter values
+    assert [(w['iface'], w['iface_params'], w['signal']) for w in run['vif_writes']] == [('pif_p', '(W=16)', 'data')]
+    # struct members are not handle accesses: only it.p.b (it is a class handle) is a knob override
+    assert [(w['path'], w['via_handle']) for w in subs['set_pair']['facts']['field_writes']] == [('p.a', False)]
+    assert subs['fill']['facts']['field_writes'] == []
+    assert [o['path'] for o in d['config']['overrides']] == ['it.p.b']
+    # code in a generate branch that is not elaborated is marked, not reported as invalid
+    assert [(p['start'], p.get('uninstantiated')) for p in d['procedures']] == [(40, True)]
+
+
 if __name__ == '__main__':
     test_probe()
-    print('probe test passed')
+    test_corpus_regressions()
+    print('probe tests passed')
