@@ -23,7 +23,8 @@ Example: the AXI UVM TB in `qs-ques-master/tutorials/sv_testbench/axi_slave_test
 so copy it there and run from the TB directory:
 
 ```sh
-~/work/myenv/bin/python ~/work/sniper/sniper.py --own . -o axi_uvm_tb_constructs.json -- -f sniper.f
+~/work/myenv/bin/python ~/work/sniper/sniper.py --own . -o axi_uvm_tb_constructs.json -- \
+    +incdir+$UVM/src $UVM/src/uvm_pkg.sv -f sniper.f        # UVM: a UVM library checkout
 ```
 
 ## Tests

@@ -6,10 +6,9 @@
 side is unconstrained.
 
 ```sh
-# 1. extract the UVM testbench (from its uvm_tb directory, see ../axi_uvm_tb)
-python ~/work/sniper/sniper.py --own . -o axi_uvm_tb_constructs.json -- -f sniper.f
-# 2. constraints -> assumes, randomize() model
-make fv FV_JSON=/path/to/axi_uvm_tb_constructs.json
+# 1. extract the UVM testbench with sniper (axi_uvm_tb_constructs.json, generated) and
+# 2. turn its constraints into assumes and a randomize() model (fv/)
+make fv QS=/path/to/qs-ques UVM=/path/to/uvm-core PYTHON=/path/to/python-with-pyslang
 # 3. the qs-ques formal targets
 make formal_cover      # 6/6 covers reached (full-line / full-lanes writes, 1-byte read, partial
                        #   AXI strobe, wlast, read issue)

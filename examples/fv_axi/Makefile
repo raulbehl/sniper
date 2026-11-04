@@ -2,15 +2,16 @@
 # Same structure as questions/shared/make.cfg (formal_cover / formal_assert, smtbmc), except that the
 # DUT is read with yosys-slang: read_verilog cannot parse `module axi_master import axi_pkg::*;`.
 #
-#   make fv              sniper JSON -> fvgen collateral in fv/
+#   make fv              sniper extraction of the UVM testbench (if missing) -> fvgen collateral in fv/
 #   make formal          formal_cover + formal_assert
 #
 QS        ?= $(HOME)/work/sniper_corpus/qs-ques
 AXI       ?= $(QS)/tutorials/sv_testbench/axi_slave_testbench
 PRIM      ?= $(QS)/tutorials/formal_verification
+UVM       ?= $(HOME)/work/uvm-verilator
 SNIPER    ?= $(abspath ../..)
 PYTHON    ?= python3
-FV_JSON   ?= axi_uvm_tb_constructs.json      # sniper output of the AXI UVM testbench (see README)
+FV_JSON   ?= axi_uvm_tb_constructs.json      # sniper output of the AXI UVM testbench (generated)
 COVER_DEPTH  ?= 30
 ASSERT_DEPTH ?= 30
 
@@ -18,7 +19,11 @@ DUT_FILES = $(AXI)/axi_pkg.sv $(QS)/questions/shared/verilog/qs_find_first.sv \
             $(QS)/questions/shared/verilog/qs_pop_cnt.sv $(AXI)/axi_master.sv
 FV_FILES  = fv/fv_constraints.sv axi_fv_top.sv
 
-fv:
+$(FV_JSON):
+	cd $(AXI)/uvm_tb && $(PYTHON) $(SNIPER)/sniper.py --own . -o $(abspath $(FV_JSON)) -- \
+	    +incdir+$(UVM)/src $(UVM)/src/uvm_pkg.sv -f $(SNIPER)/examples/axi_uvm_tb/sniper.f
+
+fv: $(FV_JSON)
 	$(PYTHON) $(SNIPER)/fvgen.py $(FV_JSON) -o fv --prim-assert-dir $(PRIM)
 
 ALL_FILES = $(abspath $(DUT_FILES) $(FV_FILES) fv/prim_assert.sv fv/prim_assert_yosys_macros.svh)
@@ -54,6 +59,6 @@ formal_assert: formal_build_assert
 formal: formal_cover formal_assert
 
 clean:
-	rm -rf fv formal_cover formal_assert formal_cover.sby formal_assert.sby
+	rm -rf fv formal_cover formal_assert formal_cover.sby formal_assert.sby $(FV_JSON)
 
 .PHONY: fv formal formal_cover formal_assert formal_build_cover formal_build_assert clean
