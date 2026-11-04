@@ -24,7 +24,7 @@ Generated (OUTDIR)
 Semantics follow IEEE 1800-2017 clauses 18 (constraints) and 19 (coverage); the report states every
 place where the formal model differs from simulation and in which direction.
 """
-import argparse, json, math, os, re, shutil, subprocess, sys
+import argparse, json, math, os, re, shutil, signal, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -2560,7 +2560,8 @@ def smoke(gen, out):
     for top, src, lib, depth, m in jobs:
         with open(os.path.join(sd, top + '.sv'), 'w') as f: f.write(src + '\n')
         defs = ' -DFV_NO_ILLEGAL_BINS' if lib == 'fv_covers.sv' else ' -DFV_LIVENESS_COVERS'
-        sby = (f'[options]\nmode cover\ndepth {depth}\n\n[engines]\nsmtbmc {gen.a.solver}\n\n[script]\n'
+        vcd = '' if gen.a.keep else 'vcd off\n'
+        sby = (f'[options]\nmode cover\ndepth {depth}\n{vcd}\n[engines]\nsmtbmc {gen.a.solver}\n\n[script]\n'
                f'read_verilog -sv -formal -DFORMAL{defs} {lib} {top}.sv\nprep -top {top}\n\n[files]\n'
                f'../{lib}\n{top}.sv\n../prim_assert.sv\n../prim_assert_yosys_macros.svh\n')
         with open(os.path.join(sd, top + '.sby'), 'w') as f: f.write(sby)
@@ -2590,8 +2591,14 @@ def run_smoke(gen, out, jobs=8):
 
     def one(item):
         top, m = item
-        r = subprocess.run(['sby', '-f', top + '.sby'], cwd=sd, capture_output=True, text=True, timeout=gen.a.timeout)
-        log = r.stdout + r.stderr
+        # own process group, so a timeout also kills the solver processes sby started
+        p = subprocess.Popen(['sby', '-f', top + '.sby'], cwd=sd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        try:
+            log = p.communicate(timeout=gen.a.timeout)[0]
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            log = p.communicate()[0] + '\nDONE (TIMEOUT)'
         # the job directory's PASS/FAIL file has the complete summary (the log truncates it)
         full = []
         for st in ('PASS', 'FAIL', 'UNKNOWN', 'ERROR', 'TIMEOUT'):
@@ -2607,10 +2614,13 @@ def run_smoke(gen, out, jobs=8):
             mm = re.match(r'\s{3,}(\S+) at ', body)
             if in_unr and mm: unreached.add(mm.group(1).split('.')[-1]); continue
             in_unr = in_unr and body.startswith('   ')
-        status = 'PASS' if 'DONE (PASS' in log else ('FAIL' if 'DONE (FAIL' in log else 'ERROR')
+        status = next((st for st in ('PASS', 'FAIL', 'TIMEOUT') if f'DONE ({st}' in log), 'ERROR')
         err = None
         if status == 'ERROR':
             err = '\n'.join(l for l in log.splitlines() if 'ERROR' in l or 'rror' in l)[:800]
+        elif status == 'TIMEOUT':
+            err = f'sby did not finish in {gen.a.timeout}s'
+        if not gen.a.keep: shutil.rmtree(os.path.join(sd, top), ignore_errors=True)
         return top, m, status, reached, unreached, err
 
     with ThreadPoolExecutor(jobs) as ex:
@@ -2653,7 +2663,8 @@ def report_md(rep):
     if rep.get('smoke'):
         s = rep['smoke']
         out.append('## Smoke runs (free inputs, cover mode)\n')
-        out.append(f"- modules: {s['modules']}, sby errors: {s['errors']}, unsatisfiable constraint sets: {s['unsat']}")
+        out.append(f"- modules: {s['modules']}, sby errors: {s['errors']}, timeouts: {s.get('timeouts', 0)}, "
+                   f"unsatisfiable constraint sets: {s['unsat']}")
         out.append(f"- covers reached: {s['reached']}/{s['covers']}\n")
         for line in s.get('problems', [])[:200]: out.append(f'- {line}')
         out.append('')
@@ -2709,6 +2720,7 @@ def main():
     ap.add_argument('--expose', action='store_true', help='test hook: atoms / bin hits as output ports')
     ap.add_argument('-j', '--jobs', type=int, default=8)
     ap.add_argument('--timeout', type=int, default=600)
+    ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')
     a = ap.parse_args()
     d = json.load(open(a.json))
     gen = Gen(d, a)
@@ -2716,10 +2728,12 @@ def main():
     rep = write_outputs(gen, a.out)
     if a.run:
         res = run_smoke(gen, a.out, a.jobs)
-        probs, reached, total, errs, unsat = [], 0, 0, 0, 0
+        probs, reached, total, errs, unsat, tmo = [], 0, 0, 0, 0, 0
         for top, m, status, rch, unr, err in res:
             if status == 'ERROR':
                 errs += 1; probs.append(f'{m.name}: sby error: {err}'); continue
+            if status == 'TIMEOUT':
+                tmo += 1; probs.append(f'{m.name}: {err} (covers reached so far: {len(rch)})'); continue
             if m.kind == 'constraints':
                 if 'sat' not in rch:
                     unsat += 1; probs.append(f'{m.name}: constraints unsatisfiable for every input')
@@ -2728,7 +2742,7 @@ def main():
             else:
                 total += len(rch) + len(unr); reached += len(rch)
                 for x in sorted(unr): probs.append(f'{m.name}: bin unreachable with free inputs: {x}')
-        gen.smoke_results = {'modules': len(res), 'errors': errs, 'unsat': unsat, 'covers': total,
+        gen.smoke_results = {'modules': len(res), 'errors': errs, 'timeouts': tmo, 'unsat': unsat, 'covers': total,
                              'reached': reached, 'problems': probs}
         rep = summarize(gen)
         with open(os.path.join(a.out, 'report.json'), 'w') as f:
@@ -2739,7 +2753,7 @@ def main():
     print(json.dumps(c))
     if rep.get('smoke'):
         s = rep['smoke']
-        print(f"smoke: {s['modules']} modules, {s['errors']} errors, {s['unsat']} unsat, "
+        print(f"smoke: {s['modules']} modules, {s['errors']} errors, {s['timeouts']} timeouts, {s['unsat']} unsat, "
               f"covers {s['reached']}/{s['covers']}")
     print(f'-> {a.out}')
 
