@@ -191,6 +191,35 @@ SKIP = {'syntax', 'sourceRange', 'bad', 'kind', 'compilation', 'parentScope', 'd
         'isUnsizedInteger', 'constant', 'type', 'scope', 'containingSymbol'}
 
 
+def type_info(t, depth=0):
+    """Layout of a type for consumers that re-model it as bit vectors: width, signedness, enum
+    values, struct fields (with bit offsets when packed), array element type and size."""
+    ct = t.canonicalType
+    k = ct.kind.name
+    ti = {'kind': k}
+    if t.isIntegral:
+        ti['w'], ti['signed'] = t.bitWidth, bool(t.isSigned)
+    if ct.isEnum:
+        ti['enum'] = [{'name': m.name, 'value': str(m.value)} for m in ct if m.kind.name == 'EnumValue']
+    if depth > 4: return ti
+    if ct.isStruct or k in ('PackedUnionType', 'UnpackedUnionType'):
+        ti['fields'] = [{'name': f.name, 'offset': f.bitOffset if t.isIntegral else None,
+                         'type': type_info(f.type, depth + 1)} for f in ct if f.kind.name == 'Field']
+    elif ct.isUnpackedArray or ct.isQueue or ct.isAssociativeArray:
+        try: ti['elem'] = type_info(ct.arrayElementType, depth + 1)
+        except Exception: pass
+        if ct.hasFixedRange:
+            r = ct.fixedRange
+            ti['range'] = [r.left, r.right]
+            ti['size'] = abs(r.left - r.right) + 1
+    elif ct.isClass:
+        ti['class'] = ct.name
+        try:
+            if ct.genericClass is not None: ti['generic'] = ct.genericClass.name
+        except Exception: pass
+    return ti
+
+
 def sym_ref(s):
     r = {'sym': s.name, 'skind': s.kind.name}
     try: r['path'] = s.hierarchicalPath
@@ -228,8 +257,16 @@ class Ser:
             if 'macro' in sp: out['macro'] = sp['macro']
             out['src'] = text(n)
         if is_expr:
-            try: out['ty'] = str(n.type)
+            try:
+                t = n.type
+                out['ty'] = str(t)
+                if t.isIntegral: out['w'], out['signed'] = t.bitWidth, bool(t.isSigned)
             except Exception: pass
+            if n.kind.name == 'MemberAccess':
+                try:
+                    if n.value.type.canonicalType.kind.name in ('PackedStructType', 'PackedUnionType'):
+                        out['offset'] = n.member.bitOffset
+                except Exception: pass
             c = const_str(n)
             if n.kind.name in LITERALS:
                 if c is None:       # not folded outside a full expression (dist weights, ...)
@@ -237,6 +274,10 @@ class Ser:
                     except Exception: c = text(n)
                 out['const'] = c
                 return out          # 'const' carries the value; the raw literal object adds nothing
+            if c is None and n.kind.name == 'NamedValue':      # references are not folded at the use site
+                try:
+                    if n.symbol.kind.name in ('EnumValue', 'Parameter'): c = str(n.symbol.value)
+                except Exception: pass
             if c is not None: out['const'] = c
         for a in sorted(set(dir(type(n))) - BASE_ATTRS[base] - SKIP):
             if a.startswith('_') or a[0].isupper(): continue
@@ -626,6 +667,65 @@ def run_const_loops(body, on_stmt, max_iter=1_000_000):
 
 
 # ======================================================================== extraction
+def option_entries(sym):
+    """option.x = v / type_option.x = v set on a coverpoint or cross"""
+    out = []
+    try:
+        for o in sym.options:
+            x = o.expression
+            if x is not None and x.kind.name == 'Assignment': x = x.right
+            v = const_str(x) if x is not None else None
+            if v is None and x is not None and x.kind.name in LITERALS:
+                v = str(x.value)
+            out.append({'name': o.name, 'type_option': bool(o.isTypeOption), 'value': v,
+                        'src': text(x) if x is not None else None})
+    except Exception:
+        pass
+    return out
+
+
+def syn_value(x, scope):
+    """Constant value of a transition item written in syntax: a literal, or a name (enum value,
+    parameter) looked up in the bin's scope. Unresolved items keep their source text."""
+    src = ' '.join(str(x).split())
+    if x.kind.name in ('IdentifierName', 'ScopedName'):
+        try:
+            sym = scope.lookupName(src)
+            if sym is not None and sym.kind.name in ('EnumValue', 'Parameter'):
+                return str(sym.value)
+        except Exception:
+            pass
+        return {'src': src}
+    if x.kind.name in ('IntegerLiteralExpression', 'IntegerVectorExpression', 'UnbasedUnsizedLiteralExpression'):
+        return src
+    return {'src': src}
+
+
+def trans_set(st, scope):
+    """(a, b => c [*2:3] => d [-> 1]) as a list of steps {values, repeat}"""
+    steps = []
+    for r in st.ranges:
+        if getattr(r, 'kind', None) is None or r.kind.name != 'TransRange': continue    # => tokens
+        vals = []
+        for it in r.items:
+            if not hasattr(it, 'kind') or it.kind.name == 'Comma': continue
+            if it.kind.name == 'OpenRangeExpression':
+                vals.append([syn_value(it.left, scope), syn_value(it.right, scope)])
+            else:
+                vals.append(syn_value(it, scope))
+        step = {'values': vals}
+        rp = r.repeat
+        if rp is not None:
+            kind = {'Star': '*', 'MinusArrow': '->', 'Equals': '='}.get(rp.specifier.kind.name, str(rp.specifier))
+            sel = rp.selector
+            if sel is None: lo = hi = None
+            elif sel.kind.name == 'BitSelect': lo = hi = syn_value(sel.expr, scope)
+            else: lo, hi = syn_value(sel.left, scope), syn_value(sel.right, scope)
+            step['repeat'] = {'kind': kind, 'from': lo, 'to': hi}
+        steps.append(step)
+    return steps
+
+
 class Extractor:
     def __init__(self, comp, loc, ser, extra_pkgs, hier_depth, skip_pkgs=()):
         self.comp, self.loc, self.ser = comp, loc, ser
@@ -638,6 +738,7 @@ class Extractor:
         self.types = {'parameters': [], 'typedefs': [], 'enums': []}
         self.imported_pkgs = set()
         self.default_specs = set()      # (path, line, name) of classes reported by default specialization
+        self.callees = {}               # path -> subroutine called from an own constraint
         self.seen = set()
 
     # ---- symbol location helpers
@@ -798,7 +899,7 @@ class Extractor:
     def prop_entry(self, m):
         p, l, mac = self.where(m)
         t = m.type
-        prop = {'name': m.name, 'line': l, 'type': str(t), 'rand': enum_name(m.randMode),
+        prop = {'name': m.name, 'line': l, 'type': str(t), 'ti': type_info(t), 'rand': enum_name(m.randMode),
                 'width': t.bitWidth if t.isIntegral else None,
                 'static': enum_name(m.lifetime) == 'Static', 'visibility': enum_name(m.visibility)}
         ct = t.canonicalType
@@ -816,6 +917,35 @@ class Extractor:
         if mac: prop['macro'] = mac
         return prop
 
+    def note_callees(self, n):
+        """user functions a constraint calls: their bodies are reported even outside the own
+        sources, so a consumer can evaluate the call (get_n_bits() in an agent package, ...)"""
+        def fn(x):
+            if x.kind.name == 'Call' and not x.isSystemCall and isinstance(x.subroutine, A.Symbol):
+                sr = x.subroutine
+                self.callees.setdefault(sr.hierarchicalPath, sr)
+
+        def con(c, depth=0):        # constraints have no visitor: walk them, visit their expressions
+            if depth > 32 or c is None: return
+            if isinstance(c, A.Expression):
+                try: c.visit(lambda x: (fn(x), A.VisitAction.Advance)[1])
+                except Exception: pass
+                return
+            if isinstance(c, A.Statement):
+                try: walk(c, fn)
+                except Exception: pass
+                return
+            for a in ('list', 'expr', 'predicate', 'body', 'ifBody', 'elseBody', 'items', 'arrayRef'):
+                try: v = getattr(c, a)
+                except Exception: continue
+                if v is None or callable(v): continue
+                if isinstance(v, (A.Expression, A.Constraint)): con(v, depth + 1)
+                else:
+                    try:
+                        for x in v: con(x, depth + 1)
+                    except TypeError: pass
+        con(n)
+
     def constraint_entry(self, m):
         cs = m.constraints
         items = list(cs.list) if cs is not None and cs.kind.name == 'List' else ([cs] if cs is not None else [])
@@ -830,6 +960,7 @@ class Extractor:
         for it in items:
             d = self.ser.node(it)
             ent['items'].append(d)
+            self.note_callees(it)
         ent['item_kinds'] = [it.kind.name for it in items]
         return ent
 
@@ -884,7 +1015,7 @@ class Extractor:
         for m in members:
             mk = m.kind.name
             if mk == 'FormalArgument':
-                ent['sample_args'].append({'name': m.name, 'type': str(m.type)})
+                ent['sample_args'].append({'name': m.name, 'type': str(m.type), 'ti': type_info(m.type)})
             elif mk == 'Coverpoint':
                 ent['coverpoints'].append(self.coverpoint_entry(m))
             elif mk == 'CoverCross':
@@ -916,11 +1047,21 @@ class Extractor:
                 return const_str(v) or text(v)
             e['ranges'] = [one(v) for v in vals]
         if '=>' in e['src']: e['transition'] = True
+        init = getattr(b.syntax, 'initializer', None) if b.syntax is not None else None
+        if init is not None and init.kind.name == 'TransListCoverageBinInitializer':
+            e['transition'] = True
+            e['trans'] = [trans_set(st, b.parentScope) for st in init.sets
+                          if getattr(st, 'kind', None) is not None and st.kind.name == 'TransSet']
         return e
 
     def coverpoint_entry(self, cp):
-        e = {'name': cp.name, **self.span(cp), 'type': str(cp.type),
+        # the coverpoint's own type drops the enum; auto bins of an enum need its values
+        x = cp.coverageExpr
+        while x is not None and x.kind.name == 'Conversion': x = x.operand
+        ti_src = x.type if x is not None and x.type.isEnum else cp.type
+        e = {'name': cp.name, **self.span(cp), 'type': str(cp.type), 'ti': type_info(ti_src),
              'width': cp.type.bitWidth if cp.type.isIntegral else None,
+             'options': option_entries(cp),
              'expr': self.ser.node(cp.coverageExpr) if cp.coverageExpr is not None else None,
              'iff': self.ser.node(cp.iffExpr) if cp.iffExpr is not None else None,
              'bins': [], 'auto_bins': True}
@@ -931,7 +1072,8 @@ class Extractor:
 
     def cross_entry(self, cx):
         e = {'name': cx.name, **self.span(cx), 'targets': [t.name for t in cx.targets],
-             'iff': self.ser.node(cx.iffExpr) if cx.iffExpr is not None else None, 'bins': []}
+             'iff': self.ser.node(cx.iffExpr) if cx.iffExpr is not None else None, 'bins': [],
+             'options': option_entries(cx)}
         def bins_in(scope):          # cross bins live in a nested CoverCrossBody scope
             for b in scope:
                 if b.kind.name == 'CoverageBin': e['bins'].append(self.bins_entry(b))
@@ -1080,6 +1222,16 @@ class Extractor:
             class_ents.append(ent)
             self.class_by_path[s.hierarchicalPath] = ent
         subs = [self.sub_entry(s) for s in self.sub_syms]
+        have = {s['path'] for s in subs}
+        for _ in range(4):                  # functions called by constraints, and what they call
+            extra = [sr for p, sr in list(self.callees.items()) if p not in have]
+            if not extra: break
+            for sr in extra:
+                have.add(sr.hierarchicalPath)
+                ent = self.sub_entry(sr)
+                ent['external'] = not self.own_sym(sr)
+                subs.append(ent)
+                if sr.body is not None: self.note_callees(sr.body)
         procs = [self.proc_entry(s) for s in self.proc_syms]
 
         # randomization inventory
