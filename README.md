@@ -78,6 +78,48 @@ CVA6, Caliptra and riscv-dv:
   `$assertoff`, a modport taken from a virtual interface handle, virtual interfaces with interface
   ports (UVMF BFMs), class handles in `&&`.
 
+## fvgen: constraints → assumes, coverage → covers
+
+`fvgen.py` turns a sniper extraction into formal collateral for Yosys (`read_verilog -sv -formal`)
+and SymbiYosys, the flow of the `qs-ques` formal examples. It reads only sniper's JSON.
+
+```sh
+python fvgen.py axi_uvm_tb_constructs.json -o fv/ --run      # --run: smoke-check with sby
+```
+
+| file | content |
+|---|---|
+| `fv_constraints.sv` | `fv_c_<class>`: constraint checker. Rand fields and the state the constraints read are inputs; each constraint item is a wire plus an `ASSUME(.., IMPLIES(en, ..))`. Parameters `CM_<block>` (constraint_mode), `SOFT_EN`, `INLINE_EN`. `fv_r_<class>`: `randomize()` model, anyseq values latched when `randomize` is high and constrained in that cycle; outputs hold between calls. One `fv_c_/fv_r_<class>__<site>` per `randomize()` call with inline constraints or an argument list, and per `std::randomize` |
+| `fv_covers.sv` | `fv_cg_<owner>__<cg>`: one `cover` per bin (label = bin name) under `sample && iff`; illegal bins are `ASSERT`s (``ifndef FV_NO_ILLEGAL_BINS``); transition bins are monitors over the sampled values |
+| `fv_bind.sv` | instantiation templates for covergroups declared in modules/interfaces |
+| `smoke/` | one top + `.sby` per module, all inputs free: constraints satisfiable, every implication/if guard reachable (dead constraint code otherwise), every bin reachable |
+| `report.md/.json` | every constraint item and bin: what it became, **exact / approx / unsupported**, why, and the direction of any approximation |
+
+Constraint semantics (IEEE 1800-2017 clause 18): inheritance with same-name block override; rand
+nested objects flattened; `->` and `if/else` as guards; `foreach` unrolled (fixed arrays; dynamic
+arrays/queues up to a maximum inferred from `size()` constraints, else `--max-array`, with
+`i < size` guards); `inside` with ranges, `$` and array operands; `dist` as membership in the
+non-zero-weight items; `unique`; `sum/product/and/or/xor() with`; single-return user functions
+(including methods of other objects and functions outside `--own`) inlined; rand enums limited to
+their named values; `solve before` ignored (ordering only); `soft` assumed under `SOFT_EN` and
+dropped at call sites whose inline constraints constrain the same field; `randomize(a, b)` frees
+only `a`, `b`. Expressions keep SV widths: every slang `Conversion` becomes a size cast plus
+`$signed/$unsigned`; `**` is lowered (the SMT backends have no `$pow`).
+
+Coverage semantics (clause 19): value bins, `[]` (one per value) and `[N]` (values split in order,
+remainder in the last), wildcard, `with` filters, `iff`, ignore/illegal values removed from every
+other bin (fully excluded bins dropped), `default`, automatic bins (enum values, or 2^w values over
+`auto_bin_max`), `at_least`, transitions with `[*m:n]`, `[->m:n]`, `[=m:n]` and array transition
+bins, crosses with automatic product bins and `binsof/intersect` (`&&`, `||`, `!`) user, ignore
+and illegal bins.
+
+`tests/test_fvgen.py`: **T1** proves 66 constraint expressions (mixed signedness, wrap-around,
+shifts, `**`, ascending ranges, packed structs, enums, casts, `inside`) equal to yosys-slang's
+elaboration of the same SV; **T2** checks whole constraint sets against Verilator's solver in both
+directions (its solutions satisfy the assumes; tuples the assumes accept, including boundary
+mutations of solutions, are accepted by `randomize() with` pins); **T3** compares every bin and
+transition monitor with an LRM reference model on random sample traces.
+
 ## Notes
 
 - Line numbers are those of the file the construct is written in (include files keep their own

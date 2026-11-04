@@ -1,0 +1,16 @@
+[options]
+mode cover
+depth 2
+
+[engines]
+smtbmc yices
+
+[script]
+read_verilog -sv -formal -DFORMAL -DFV_LIVENESS_COVERS fv_constraints.sv smoke_fv_c_mem_req_item.sv
+prep -top smoke_fv_c_mem_req_item
+
+[files]
+../fv_constraints.sv
+smoke_fv_c_mem_req_item.sv
+../prim_assert.sv
+../prim_assert_yosys_macros.svh

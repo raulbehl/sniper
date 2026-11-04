@@ -344,6 +344,8 @@ class cov_c;
       ignore_bins i1 = binsof(cp_y) intersect {[6:7]};
       bins sel = binsof(cp_x.lo) && binsof(cp_y) intersect {0};
       illegal_bins il2 = binsof(cp_x.mid) intersect {6} && binsof(cp_y) intersect {5};
+      ignore_bins i2 = binsof(cp_x.lo) with (cp_x == 2);
+      illegal_bins il3 = binsof(cp_x.w) with (cp_y == 3);
     }
   endgroup
   function new(); cg = new(); endfunction
@@ -395,6 +397,8 @@ def t3_reference(trace):
             for b in xb:                            # cross products (transition / default bins are not crossed)
                 if y in (6, 7): continue            # ignore_bins i1
                 if b == 'mid__6' and y == 5: continue     # illegal_bins il2
+                if b == 'lo' and x == 2: continue         # ignore_bins i2 (with filter: value combinations)
+                if b == 'w' and y == 3: continue          # illegal_bins il3 (with filter)
                 if b == 'lo' and y == 0: h.add('cov_x_xy__sel'); continue
                 h.add(f'cov_x_xy__{b}__auto_{y}')
         hits.append(h)

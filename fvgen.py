@@ -1666,6 +1666,8 @@ class CoverGen:
                 self.entry_note(None, f'sampling event has an iff condition ({iff}); drive `sample` with it')
         cps = {}
         for cp in cg['coverpoints']:
+            if not cp.get('name'):      # unlabelled: named after its expression, as simulators report it
+                cp = {**cp, 'name': ident((cp.get('expr') or {}).get('src') or 'cp')}
             try:
                 cps[cp['name']] = self.coverpoint(cp)
             except Unsupported as e:
@@ -1779,13 +1781,13 @@ class CoverGen:
         ex_cond = ' && '.join(f'!{e}' for e in excl) if excl else None
 
         def emit_bin(name, cond, ent, values=None):
-            if values is not None and excl_vals:
-                vs = [v for v in values] if isinstance(values, list) else list(range(values[0], values[1] + 1)) \
-                    if values[1] - values[0] < 4096 else None
-                if vs is not None and set(vs) <= excl_vals:     # every value ignored/illegal: no bin
+            ivs = to_ivs(values)
+            if ivs is not None and excl_vals:
+                size = sum(h - l + 1 for l, h in ivs)
+                if size <= len(excl_vals) and all(v in excl_vals for l, h in ivs for v in range(l, h + 1)):
                     ent.setdefault('notes', []).append(f'{name}: all values ignored/illegal, bin removed')
                     return
-                if vs is not None and isinstance(values, list): values = [v for v in vs if v not in excl_vals]
+            values = ivs
             full = f'{iff} && {cond}' + (f' && {ex_cond}' if ex_cond else '')
             self.cover(f"{cp['name']}__{name}", full, ent, at_least)
             cpinfo['bins'].append(Bin(name, f'({cond}' + (f' && {ex_cond})' if ex_cond else ')'), 'Bins', values, ent))
@@ -1939,6 +1941,11 @@ class CoverGen:
             c, _ = self.bin_set(cp, cpinfo, b)
             emit_bin(ident(b['name']), c, ent)
             return
+        if nbins is not None and b.get('withExpr') is None:
+            ivs = self.intervals(cpinfo, items, wild)
+            if ivs is not None:
+                self.fixed_bins(cpinfo, b, ent, emit_bin, ivs, nbins, iff_b)
+                return
         vals = self.const_values(cpinfo, items, wild)
         if vals is None:
             raise Unsupported(f"array bin {b['name']}: values not constant or more than --max-bins "
@@ -1981,6 +1988,71 @@ class CoverGen:
                 if iff_b: c = f'({c} && {iff_b})'
                 emit_bin(f"{ident(b['name'])}__{i}", c, ent, g)
             ent.setdefault('notes', []).append(f'{nbins} bins over {n} values')
+
+    def intervals(self, cpinfo, items, wild):
+        """constant value list as (lo, hi) intervals in source order (duplicates kept), or None"""
+        lo_t, hi_t = self.tmin_max(cpinfo)
+        out = []
+        for it in items:
+            if it[0] == 'e': return None
+            if it[0] == 'v':
+                if it[1].x:
+                    vs = self.const_values(cpinfo, [it], wild)
+                    if vs is None: return None
+                    out += [(v, v) for v in vs]
+                else:
+                    out.append((it[1].v, it[1].v))
+            else:
+                lo, hi = it[1], it[2]
+                if isinstance(lo, tuple) or isinstance(hi, tuple): return None
+                a = lo.v if lo is not None else lo_t
+                b = hi.v if hi is not None else hi_t
+                if a <= b: out.append((a, b))      # [hi:lo] with hi > lo is empty
+        return out
+
+    def fixed_bins(self, cpinfo, b, ent, emit_bin, ivs, nbins, iff_b):
+        """bins b[N] = {...}: the n listed values (in order) split into N bins of n/N, the last one
+        taking the remainder; with more bins than values each value gets one and the rest are empty
+        (LRM 19.5.1)"""
+        n = sum(h - l + 1 for l, h in ivs)
+        if n == 0: return
+        if nbins > n:
+            groups = [[(v, v)] for l, h in ivs for v in range(l, h + 1)]
+            ent.setdefault('notes', []).append(f'{nbins - n} of {nbins} bins are empty (more bins than values)')
+        else:
+            per = n // nbins
+            groups, cur, need = [], [], per
+            stream = list(ivs)
+            i = 0
+            while i < len(stream):
+                l, h = stream[i]
+                if len(groups) == nbins - 1:          # the last bin takes everything left
+                    cur.append((l, h)); i += 1; continue
+                take = min(need, h - l + 1)
+                cur.append((l, l + take - 1))
+                need -= take
+                if take < h - l + 1: stream[i] = (l + take, h)
+                else: i += 1
+                if need == 0:
+                    groups.append(cur); cur, need = [], per
+            if cur: groups.append(cur)
+        for i, g in enumerate(groups):
+            c = self.ranges_cond(cpinfo, g)
+            if iff_b: c = f'({c} && {iff_b})'
+            emit_bin(f"{ident(b['name'])}__{i}", c, ent, g)
+        ent.setdefault('notes', []).append(f'{nbins} bins over {n} values')
+
+    def ranges_cond(self, cpinfo, ivs):
+        w, s, x = cpinfo['w'], cpinfo['s'], cpinfo['v']
+        lo_t, hi_t = self.tmin_max(cpinfo)
+        parts = []
+        for a, b in merge_ivs(ivs):
+            if a == b: parts.append(f'({x} == {lit(a, w, s)})')
+            elif a == lo_t and b == hi_t: parts.append("1'b1")
+            elif a == lo_t: parts.append(f'({x} <= {lit(b, w, s)})')
+            elif b == hi_t: parts.append(f'({x} >= {lit(a, w, s)})')
+            else: parts.append(f'({x} >= {lit(a, w, s)} && {x} <= {lit(b, w, s)})')
+        return '(' + ' || '.join(parts) + ')'
 
     def values_cond(self, cpinfo, vals):
         """membership in a constant value list, as ranges"""
@@ -2178,6 +2250,7 @@ class CoverGen:
         base_cond = ' && '.join(iffs + ([xiff] if xiff else [])) or "1'b1"
         tuples = list(product([list(range(len(c['bins']))) for c in tgt])) if total <= self.gen.a.max_cross * 8 else None
         ignored, illegal, user = set(), set(), []
+        partial = {}            # product -> filter conditions of ignore/illegal bins that remove part of it
         at_least = self.opt(cx, 'at_least', 1)
         for b in cx['bins']:
             ent = {'kind': 'cross_bin', 'covergroup': self.cg['name'], 'owner': self.owner, 'cross': cx['name'],
@@ -2188,29 +2261,37 @@ class CoverGen:
                 ent['notes'] = [f'cross has {total} products (> 8 x --max-cross): select expressions not evaluated']
                 self.entries.append(ent); continue
             try:
-                sel = self.select(b.get('crossSelectExpr'), tgt, tuples, cps)
+                sel, filt = self.select_filtered(b.get('crossSelectExpr'), tgt, tuples, cps)
             except Unsupported as e:
                 ent['status'] = 'unsupported'; ent['notes'] = [str(e)]
                 self.entries.append(ent); continue
-            if b['kind'] == 'IgnoreBins': ignored |= sel; ent['notes'] = [f'{len(sel)} products ignored']
+            if b['kind'] in ('IgnoreBins', 'IllegalBins') and filt is not None:
+                # `with` selects value combinations, not whole products: the products stay, those
+                # combinations are removed from them (LRM 19.6.1.2)
+                for t in sel: partial.setdefault(t, []).append(filt)
+            if b['kind'] == 'IgnoreBins':
+                if filt is None: ignored |= sel
+                ent['notes'] = [f'{len(sel)} products ignored' + (' where the with filter holds' if filt else '')]
             elif b['kind'] == 'IllegalBins':
-                illegal |= sel
+                if filt is None: illegal |= sel
                 if sel:
                     c = ' || '.join(self.tuple_cond(tgt, t) for t in sorted(sel))
+                    if filt: c = f'({c}) && {filt}'
                     self.illegal(f"{cx['name']}__{b['name']}", f'{base_cond} && ({c})', ent)
-                ent['notes'] = [f'{len(sel)} products: illegal (assertion)']
+                ent['notes'] = [f'{len(sel)} products: illegal (assertion)' + (' with filter' if filt else '')]
             else:
-                user.append((b, sel, ent))
+                user.append((b, sel, ent, filt))
             self.entries.append(ent) if b['kind'] != 'Bins' else None
         # user bins: a hit of any selected product (ignore / illegal products removed)
         covered = set()
-        for b, sel, ent in user:
+        for b, sel, ent, filt in user:
             keep = sel - ignored - illegal
             covered |= sel
             if not keep:
                 ent['notes'] = ['empty after ignore/illegal products are removed']
             else:
-                c = ' || '.join(self.tuple_cond(tgt, t) for t in sorted(keep))
+                c = ' || '.join(self.tuple_cond(tgt, t, partial) for t in sorted(keep))
+                if filt: c = f'({c}) && {filt}'
                 self.cover(f"{cx['name']}__{ident(b['name'])}", f'{base_cond} && ({c})', ent, at_least)
                 ent.setdefault('notes', []).append(f'{len(keep)} products')
             self.entries.append(ent)
@@ -2228,12 +2309,33 @@ class CoverGen:
                 auto = auto[:self.gen.a.max_cross]
             for t in auto:
                 nm = '__'.join(tgt[i]['bins'][j].name for i, j in enumerate(t))
-                self.cover(f"{cx['name']}__{nm}", f'{base_cond} && {self.tuple_cond(tgt, t)}', ent, at_least)
+                self.cover(f"{cx['name']}__{nm}", f'{base_cond} && {self.tuple_cond(tgt, t, partial)}', ent, at_least)
             ent.setdefault('notes', []).append(f'{len(auto)} automatic cross bins')
         self.entries.append(ent)
 
-    def tuple_cond(self, tgt, t):
-        return '(' + ' && '.join(tgt[i]['bins'][j].cond for i, j in enumerate(t)) + ')'
+    def tuple_cond(self, tgt, t, partial=None):
+        c = '(' + ' && '.join(tgt[i]['bins'][j].cond for i, j in enumerate(t)) + ')'
+        if partial and t in partial:
+            c = f"({c} && !({' || '.join(partial[t])}))"
+        return c
+
+    def select_filtered(self, e, tgt, tuples, cps):
+        """(products, filter condition or None): `select with (expr)` keeps the products of the select
+        and restricts them to value combinations where expr holds; coverpoint names in expr stand for
+        their values"""
+        if e is not None and e.get('k') == 'WithFilter':
+            if e.get('matchesExpr') is not None:
+                raise Unsupported('cross select `with ... matches`')
+            sel = self.select(e['expr'], tgt, tuples, cps)
+            tx = self.tx
+            saved = dict(tx.env)
+            for c in tgt: tx.env['#' + c['name']] = S(c['v'], c['w'], c['s'], None, True)
+            try:
+                f = tx.boolean(tx.scalar(e['filter'])).t
+            finally:
+                tx.env = saved
+            return sel, f'({f})'
+        return self.select(e, tgt, tuples, cps), None
 
     def select(self, e, tgt, tuples, cps):
         """set of products (tuples of bin indices) selected by a cross select expression (LRM 19.6.1)"""
@@ -2278,12 +2380,9 @@ class CoverGen:
                 items = [[lo_t if a is None else a, hi_t if b is None else b] for a, b in items]
                 keep = set()
                 for j in bins_ok:
-                    vals = tgt[ci]['bins'][j].values
-                    if vals is None: raise Unsupported(f'bin {tgt[ci]["bins"][j].name} has no constant value set')
-                    if isinstance(vals, tuple):           # auto range bin (lo, hi)
-                        if any(not (b < vals[0] or a > vals[1]) for a, b in items): keep.add(j)
-                    elif any(a <= v <= b for v in vals for a, b in items):
-                        keep.add(j)
+                    ivs = tgt[ci]['bins'][j].values
+                    if ivs is None: raise Unsupported(f'bin {tgt[ci]["bins"][j].name} has no constant value set')
+                    if any(not (b < lo or a > hi) for lo, hi in ivs for a, b in items): keep.add(j)
                 bins_ok = keep
             return {t for t in tuples if t[ci] in bins_ok}
         if k == 'Unary':
@@ -2294,6 +2393,21 @@ class CoverGen:
         if k == 'CrossId':
             return set(tuples)
         raise Unsupported(f'cross select {k} ({e.get("src", "")})')
+
+
+def to_ivs(values):
+    """bin values as (lo, hi) intervals: from a value list, one (lo, hi) range, or intervals"""
+    if values is None: return None
+    if isinstance(values, tuple): return [values]
+    return [v if isinstance(v, tuple) else (v, v) for v in values]
+
+
+def merge_ivs(ivs):
+    out = []
+    for a, b in sorted(ivs):
+        if out and a <= out[-1][1] + 1: out[-1] = (out[-1][0], max(out[-1][1], b))
+        else: out.append((a, b))
+    return out
 
 
 def to_signed(v, cpinfo):
@@ -2556,6 +2670,25 @@ def report_md(rep):
         out.append('')
     sect('Constraints', ('constraint', 'class', 'site', 'model'))
     sect('Coverage', ('bin', 'cross_bin', 'coverpoint', 'cross'))
+    # every item and bin, with what it became
+    out.append('## Mapping\n')
+    out.append('| source | item | status | generated |')
+    out.append('|---|---|---|---|')
+    n = 0
+    for e in rep['entries']:
+        if e.get('kind') not in ('constraint', 'bin', 'cross_bin'): continue
+        n += 1
+        if n > 20000: out.append('| ... | truncated | | |'); break
+        where = f"{e.get('file')}:{e.get('line')}" if e.get('line') else (e.get('file') or '')
+        if e['kind'] == 'constraint':
+            item = f"{e.get('class') or ''}::{e.get('block')} `{(e.get('src') or '').replace('|', '\\|')[:90]}`"
+            if e.get('site'): item += f" (at {e['site']})"
+            gen = ', '.join(e.get('assumes', [])[:6]) + (' ...' if len(e.get('assumes', [])) > 6 else '')
+        else:
+            item = f"{e.get('covergroup')}.{e.get('coverpoint') or e.get('cross')}.{e.get('bin')}"
+            gen = ', '.join((e.get('covers', []) + e.get('asserts', []))[:6]) + \
+                (' ...' if len(e.get('covers', []) + e.get('asserts', [])) > 6 else '')
+        out.append(f"| {where} | {item} | {e.get('status', 'exact')} | {gen or '-'} |")
     return '\n'.join(out) + '\n'
 
 
@@ -2567,7 +2700,7 @@ def main():
     ap.add_argument('--inherited', action='store_true', help='also emit classes that only inherit constraints')
     ap.add_argument('--max-array', type=int, default=8, help='elements modelled for a dynamic array/queue')
     ap.add_argument('--max-bins', type=int, default=256, help='values expanded for one array bin')
-    ap.add_argument('--max-cross', type=int, default=512, help='automatic cross bins emitted per cross')
+    ap.add_argument('--max-cross', type=int, default=4096, help='automatic cross bins emitted per cross')
     ap.add_argument('--max-rep', type=int, default=16, help='largest transition repeat count modelled')
     ap.add_argument('--prim-assert-dir', default=os.path.expanduser(
         '~/work/sniper_corpus/qs-ques/tutorials/formal_verification'), help='dir with prim_assert.sv and the yosys macros')

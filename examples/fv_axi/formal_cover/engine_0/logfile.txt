@@ -1,0 +1,43 @@
+##   0:00:00  Solver: yices
+##   0:00:00  Checking cover reachability in step 0..
+##   0:00:00  Checking cover reachability in step 1..
+##   0:00:00  Checking cover reachability in step 2..
+##   0:00:00  Checking cover reachability in step 3..
+##   0:00:00  Reached cover statement in step 3 at axi_fv_top: axi_fv_top.sv:73.104-73.165 (_witness_.check_cover_axi_fv_top_sv_73_1883)
+##   0:00:00  Writing trace to VCD file: engine_0/trace0.vcd
+##   0:00:00  Writing trace to Verilog testbench: engine_0/trace0_tb.v
+##   0:00:00  Writing trace to constraints file: engine_0/trace0.smtc
+##   0:00:00  Writing trace to Yosys witness file: engine_0/trace0.yw
+##   0:00:00  Checking cover reachability in step 3..
+##   0:00:00  Reached cover statement in step 3 at axi_fv_top: axi_fv_top.sv:75.105-75.172 (_witness_.check_cover_axi_fv_top_sv_75_1899)
+##   0:00:00  Writing trace to VCD file: engine_0/trace1.vcd
+##   0:00:00  Writing trace to Verilog testbench: engine_0/trace1_tb.v
+##   0:00:00  Writing trace to constraints file: engine_0/trace1.smtc
+##   0:00:00  Writing trace to Yosys witness file: engine_0/trace1.yw
+##   0:00:00  Checking cover reachability in step 3..
+##   0:00:00  Reached cover statement in step 3 at axi_fv_top: axi_fv_top.sv:74.105-74.189 (_witness_.check_cover_axi_fv_top_sv_74_1890)
+##   0:00:00  Writing trace to VCD file: engine_0/trace2.vcd
+##   0:00:00  Writing trace to Verilog testbench: engine_0/trace2_tb.v
+##   0:00:00  Writing trace to constraints file: engine_0/trace2.smtc
+##   0:00:00  Writing trace to Yosys witness file: engine_0/trace2.yw
+##   0:00:00  Checking cover reachability in step 3..
+##   0:00:00  Checking cover reachability in step 4..
+##   0:00:01  Checking cover reachability in step 5..
+##   0:00:01  Reached cover statement in step 5 at axi_fv_top: axi_fv_top.sv:77.103-77.161 (_witness_.check_cover_axi_fv_top_sv_77_1916)
+##   0:00:01  Writing trace to VCD file: engine_0/trace3.vcd
+##   0:00:01  Writing trace to Verilog testbench: engine_0/trace3_tb.v
+##   0:00:01  Writing trace to constraints file: engine_0/trace3.smtc
+##   0:00:01  Writing trace to Yosys witness file: engine_0/trace3.yw
+##   0:00:01  Checking cover reachability in step 5..
+##   0:00:01  Reached cover statement in step 5 at axi_fv_top: axi_fv_top.sv:78.104-78.154 (_witness_.check_cover_axi_fv_top_sv_78_1922)
+##   0:00:01  Writing trace to VCD file: engine_0/trace4.vcd
+##   0:00:01  Writing trace to Verilog testbench: engine_0/trace4_tb.v
+##   0:00:01  Writing trace to constraints file: engine_0/trace4.smtc
+##   0:00:01  Writing trace to Yosys witness file: engine_0/trace4.yw
+##   0:00:01  Checking cover reachability in step 5..
+##   0:00:01  Reached cover statement in step 5 at axi_fv_top: axi_fv_top.sv:76.107-76.191 (_witness_.check_cover_axi_fv_top_sv_76_1907)
+##   0:00:01  Writing trace to VCD file: engine_0/trace5.vcd
+##   0:00:01  Writing trace to Verilog testbench: engine_0/trace5_tb.v
+##   0:00:01  Writing trace to constraints file: engine_0/trace5.smtc
+##   0:00:01  Writing trace to Yosys witness file: engine_0/trace5.yw
+##   0:00:01  Status: passed

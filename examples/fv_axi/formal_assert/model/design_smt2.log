@@ -1,0 +1,199 @@
+
+ /----------------------------------------------------------------------------\
+ |  yosys -- Yosys Open SYnthesis Suite                                       |
+ |  Copyright (C) 2012 - 2026  Claire Xenia Wolf <claire@yosyshq.com>         |
+ |  Distributed under an ISC-like license, type "license" to see terms        |
+ \----------------------------------------------------------------------------/
+ Yosys 0.70+post (git sha1 0c11ea098be065e585a90a06e7b7da49936cf231, Release, AppleClang clang++ 21.0.0.21000334)
+
+-- Executing script file `design_smt2.ys' --
+
+1. Executing RTLIL frontend.
+Input filename: design_prep.il
+
+2. Executing HIERARCHY pass (managing design hierarchy).
+Attribute `top' found on module `axi_fv_top'. Setting top module to axi_fv_top.
+
+2.1. Analyzing design hierarchy..
+Top module:  \axi_fv_top
+Used module:     \axi_master
+Used module:     \fv_r_mem_req_item
+Used module:         $paramod\fv_c_mem_req_item\CM_c_shape=1'1\CM_c_run=1'1\CM_c_addr=1'1
+
+2.2. Analyzing design hierarchy..
+Top module:  \axi_fv_top
+Used module:     \axi_master
+Used module:     \fv_r_mem_req_item
+Used module:         $paramod\fv_c_mem_req_item\CM_c_shape=1'1\CM_c_run=1'1\CM_c_addr=1'1
+Removed 0 unused modules.
+Module $paramod\fv_c_mem_req_item\CM_c_shape=1'1\CM_c_run=1'1\CM_c_addr=1'1 directly or indirectly contains formal properties -> setting "keep" attribute.
+Module axi_fv_top directly or indirectly contains formal properties -> setting "keep" attribute.
+Module fv_r_mem_req_item directly or indirectly contains formal properties -> setting "keep" attribute.
+
+3. Executing FORMALFF pass.
+
+4. Executing DFFUNMAP pass (unmap clock enable and synchronous reset from FFs).
+
+5. Printing statistics.
+
+=== $paramod\fv_c_mem_req_item\CM_c_shape=1'1\CM_c_run=1'1\CM_c_addr=1'1 ===
+
+        +----------Local Count, excluding submodules.
+        | 
+       51 wires
+      303 wire bits
+       25 public wires
+      246 public wire bits
+        9 ports
+      230 port bits
+       42 cells
+        1   $add
+        8   $assume
+        3   $eq
+        1   $eqx
+        2   $ge
+        3   $le
+        4   $logic_and
+        8   $logic_not
+       11   $logic_or
+        1   $mux
+
+=== axi_fv_top ===
+
+        +----------Local Count, excluding submodules.
+        | 
+       67 wires
+      637 wire bits
+       45 public wires
+      552 public wire bits
+        2 ports
+        2 port bits
+       41 cells
+        1   $add
+        1   $anyinit
+       10   $anyseq
+        2   $assert
+        2   $assume
+        1   $eqx
+        4   $ff
+        1   $le
+        3   $logic_and
+        3   $logic_not
+        2   $logic_or
+        4   $mux
+        1   $not
+        2   $reduce_bool
+        2   $shl
+        1   $sub
+        1   $xor
+        2 submodules
+        1   axi_master
+        1   fv_r_mem_req_item
+
+=== axi_master ===
+
+        +----------Local Count, excluding submodules.
+        | 
+     1972 wires
+    20893 wire bits
+      249 public wires
+     7954 public wire bits
+       38 ports
+      485 port bits
+     2861 cells
+        5   $add
+      985   $and
+      458   $anyinit
+        1   $assume
+        1   $bmux
+       61   $eq
+       21   $logic_not
+      761   $mux
+        1   $ne
+      136   $not
+      336   $or
+       92   $reduce_or
+        2   $shl
+        1   $sub
+
+=== fv_r_mem_req_item ===
+
+        +----------Local Count, excluding submodules.
+        | 
+       22 wires
+      685 wire bits
+       15 public wires
+      457 public wire bits
+        9 ports
+      230 port bits
+       20 cells
+        6   $anyseq
+        1   $assume
+        6   $ff
+        6   $mux
+        1   $not
+        1 submodules
+        1   $paramod\fv_c_mem_req_item\CM_c_shape=1'1\CM_c_run=1'1\CM_c_addr=1'1
+
+=== design hierarchy ===
+
+        +----------Count including submodules.
+        | 
+     2964 axi_fv_top
+     2861 axi_master
+       20 fv_r_mem_req_item
+       42   $paramod\fv_c_mem_req_item\CM_c_shape=1'1\CM_c_run=1'1\CM_c_addr=1'1
+
+        +----------Count including submodules.
+        | 
+     2112 wires
+    22518 wire bits
+      334 public wires
+     9209 public wire bits
+       58 ports
+      947 port bits
+        - memories
+        - memory bits
+        - processes
+     2964 cells
+        7   $add
+      985   $and
+      459   $anyinit
+       16   $anyseq
+        2   $assert
+       12   $assume
+        1   $bmux
+       64   $eq
+        2   $eqx
+       10   $ff
+        2   $ge
+        4   $le
+        7   $logic_and
+       32   $logic_not
+       13   $logic_or
+      772   $mux
+        1   $ne
+      138   $not
+      336   $or
+        2   $reduce_bool
+       92   $reduce_or
+        4   $shl
+        2   $sub
+        1   $xor
+        2 submodules
+        1   axi_master
+        1   fv_r_mem_req_item
+
+6. Executing SMT2 backend.
+
+6.1. Executing BMUXMAP pass.
+
+6.2. Executing DEMUXMAP pass.
+Creating SMT-LIBv2 representation of module axi_master.
+Creating SMT-LIBv2 representation of module $paramod\fv_c_mem_req_item\CM_c_shape=1'1\CM_c_run=1'1\CM_c_addr=1'1.
+Creating SMT-LIBv2 representation of module fv_r_mem_req_item.
+Creating SMT-LIBv2 representation of module axi_fv_top.
+
+End of script. Logfile hash: 2b8fe26c81, time: 0.06s, user: 0.07s, system: 0.01s, MEM: 23.94 MB peak
+Yosys 0.70+post (git sha1 0c11ea098be065e585a90a06e7b7da49936cf231, Release, AppleClang clang++ 21.0.0.21000334)
+Time spent: 75% 2x write_smt2 (0 sec), 18% 2x read_rtlil (0 sec), ...
