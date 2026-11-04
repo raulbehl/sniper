@@ -136,6 +136,8 @@ package ra_pkg;   // fvgen regressions from real testbenches; fv_regress_b.sv re
       cp_p1 : coverpoint p1 { bins b1 = {1, [2:5], [6:10]}; bins b2 = {-1, [1:10], 15}; }
       // a constant iff (cva6 uvme_axi_covg: ignore_bins IGN_SIZE3 = {3} iff (XLEN == 32))
       cp_k : coverpoint rs { bins v[] = {[0:3]}; ignore_bins i3 = {3} iff (W == 32); ignore_bins i0 = {0} iff (W == 64); }
+      // array bins with a filter: one bin per value that passes (cva6 RAL: {[0:$]} with (!(item inside {0})))
+      cp_f : coverpoint rs { bins legal[] = {0}; bins illegal[] = {[0:$]} with (!(item inside {0})); }
     endgroup
     function new(); cg = new(); endfunction
   endclass

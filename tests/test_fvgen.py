@@ -546,6 +546,8 @@ def test_regressions():
     assert "(cp_cp_p1 == 3'sh7) || ((cp_cp_p1 >= 3'sh1) && (cp_cp_p1 <= 3'sh3))" in wires['h_cp_p1__b2']   # -1
     assert [h for h in rep['hit_order']['fv_cg_vr_c__cg'] if 'cp_k' in h] == ['cov_cp_k__v__0', 'cov_cp_k__v__1',
                                                                                'cov_cp_k__v__2']
+    assert [h for h in rep['hit_order']['fv_cg_vr_c__cg'] if 'cp_f' in h] == [
+        'cov_cp_f__legal__0', 'cov_cp_f__illegal__1', 'cov_cp_f__illegal__2', 'cov_cp_f__illegal__3']
     vr_notes = [n for e in rep['entries'] if e.get('covergroup') == 'cg' and e.get('owner', '').endswith('vr_c')
                 for n in e.get('notes', [])]
     assert any('value 7 is outside the coverpoint type (2-bit unsigned)' in n for n in vr_notes)

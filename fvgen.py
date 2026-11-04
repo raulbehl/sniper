@@ -531,10 +531,36 @@ class Tx:
     def x_Inside(self, n):
         left = n['left']
         L = self.ex(left)
+        k = self.inside_const(L, n['rangeList'])
+        if k is not None: return S("1'b1" if k else "1'b0", 1, False, K(int(k), 1))
         alts = []
         for it in n['rangeList']:
             alts.extend(self.member_conds(L, it))
         return S('(' + ' || '.join(alts) + ')' if alts else "1'b0", 1, False)
+
+    def inside_const(self, L, items):
+        """L inside {items} when L and every item are constants (no x/z), else None"""
+        if not isinstance(L, S) or L.k is None or L.k.x: return None
+        hit = False
+        for it in items:
+            itk = strip_conv(it)
+            if itk.get('k') == 'ValueRange':
+                b = it if it.get('k') == 'ValueRange' else itk
+                ok = True
+                for side, op in (('left', 1), ('right', -1)):
+                    bn = b[side]
+                    if strip_conv(bn).get('k') == 'UnboundedLiteral': continue
+                    bv = self.cast(self.scalar(bn), L.w, L.s)
+                    if bv.k is None or bv.k.x: return None
+                    ok = ok and ((L.k.v >= bv.k.v) if op == 1 else (L.k.v <= bv.k.v))
+                hit = hit or ok
+            else:
+                R = self.ex(it)
+                if not isinstance(R, S) or R.k is None or R.k.x: return None
+                R = self.cast(R, L.w, L.s) if R.w != L.w else R
+                if R.k is None: return None
+                hit = hit or R.k.v == L.k.v
+        return hit
 
     def member_conds(self, L, it, wild=True):
         """conditions for L inside one item of an open range list (value, range, or unpacked array)"""
