@@ -3556,14 +3556,8 @@ class RtlMap:
         return ' '.join(args)
 
     def tops(self):
-        """the DUT and the bind modules (modules in --rtl-bind files that contain bind directives)"""
-        out = [self.a.rtl_top]
-        for fl in self.a.rtl_bind or []:
-            for path in [l.strip() for l in open(fl) if l.strip() and not l.strip().startswith(('+', '-', '//'))]:
-                txt = open(path).read() if os.path.exists(path) else ''
-                for m in re.finditer(r'^\s*module\s+(\w+)(.*?)endmodule', txt, re.S | re.M):
-                    if re.search(r'^\s*bind\s', m.group(2), re.M) and m.group(1) not in out: out.append(m.group(1))
-        return out
+        """the DUT and the testbench's bind modules (given: rtl config bind_tops / --rtl-bind-top)"""
+        return [self.a.rtl_top] + [t for t in self.a.rtl_bind_top or [] if t != self.a.rtl_top]
 
     def top_args(self):
         return ' '.join(f'--top {t}' for t in self.tops())
@@ -3704,6 +3698,40 @@ class RtlMap:
         return out
 
 
+RTL_KEYS = {'top': str, 'filelists': list, 'binds': list, 'bind_tops': list, 'defines': list, 'clock': list,
+            'reset': str, 'reset_active_low': bool, 'depth': int}
+
+
+def load_rtl_config(a):
+    """the RTL setup: --rtl-config (TOML; paths relative to the file) with command-line --rtl-* overrides"""
+    cfg = {}
+    if a.rtl_config:
+        import tomllib
+        with open(a.rtl_config, 'rb') as f: cfg = tomllib.load(f)
+        unknown = set(cfg) - set(RTL_KEYS)
+        if unknown: sys.exit(f"{a.rtl_config}: unknown keys {', '.join(sorted(unknown))} (known: {', '.join(RTL_KEYS)})")
+        base = os.path.dirname(os.path.abspath(a.rtl_config))
+        if isinstance(cfg.get('clock'), str): cfg['clock'] = [cfg['clock']]
+        for k, t in RTL_KEYS.items():
+            if k in cfg and not isinstance(cfg[k], t): sys.exit(f'{a.rtl_config}: {k} must be a {t.__name__}')
+        for k in ('filelists', 'binds'):
+            if k in cfg: cfg[k] = [os.path.join(base, x) for x in cfg[k]]
+    a.rtl_top = a.rtl_top or cfg.get('top')
+    a.rtl = a.rtl or cfg.get('filelists')
+    a.rtl_bind = a.rtl_bind or cfg.get('binds') or []
+    a.rtl_bind_top = a.rtl_bind_top or cfg.get('bind_tops') or []
+    a.rtl_define = a.rtl_define or cfg.get('defines') or []
+    a.rtl_clock = a.rtl_clock or cfg.get('clock')
+    a.rtl_reset = a.rtl_reset or cfg.get('reset')
+    if a.rtl_reset_low is None: a.rtl_reset_low = cfg.get('reset_active_low')
+    if a.rtl_depth is None: a.rtl_depth = cfg.get('depth', 40)
+    missing = [k for k, v in (('top', a.rtl_top), ('filelists', a.rtl), ('clock', a.rtl_clock), ('reset', a.rtl_reset),
+                              ('reset_active_low', a.rtl_reset_low)) if v is None or v == []]
+    if missing:
+        sys.exit('the RTL run needs ' + ', '.join(missing) + ' (in --rtl-config, or --rtl-* options); see '
+                 'examples/rtl_config.toml')
+
+
 def rtl_flow(gen, out):
     """the DUT in the formal model: each covergroup whose inputs map to DUT signals is sampled
     every cycle on the RTL (DUT inputs free, reset held for the first cycles); every bin it can
@@ -3727,10 +3755,11 @@ def rtl_flow(gen, out):
                                                 a.rtl_define or [], kinds=('assume',), keep=keep)
     rm = RtlMap(gen, lowered)
     mc = rm.mixed_edges
-    clk = [p for p, (d, w) in rm.ports.items() if d == 'input' and w == 1 and re.search(r'clk|clock', p, re.I)]
-    rst = a.rtl_reset or next((p for p, (d, w) in rm.ports.items() if d == 'input' and w == 1 and
-                               re.search(r'rst|reset', p, re.I)), None)
-    rst_low = a.rtl_reset_low if a.rtl_reset_low is not None else bool(rst and re.search(r'(_n|_ni|n)$', rst))
+    clk, rst, rst_low = list(a.rtl_clock), a.rtl_reset, a.rtl_reset_low
+    inputs = sorted(p for p, (d, w) in rm.ports.items() if d == 'input')
+    bad = [p for p in clk + [rst] if p not in inputs]
+    if bad:
+        sys.exit(f"rtl config: {', '.join(bad)} not an input port of {a.rtl_top}; its inputs: {', '.join(inputs)}")
     gen.rtl_rows, gen.rtl_info = [], {'dut': a.rtl_top, 'instance': rm.dut_path, 'clock': clk, 'reset': rst,
                                       'reset_active_low': rst_low, 'notes': rm.notes, 'sva': sva,
                                       'multiclock': mc, 'tops': rm.tops()}
@@ -4056,20 +4085,25 @@ def main():
     ap.add_argument('--witness', action='store_true', help='reach every bin from the randomize() model of the class '
                     'whose fields the covergroup samples, and write fv_replay.sv: override classes that make a '
                     'simulation hit a chosen bin with any seed')
-    ap.add_argument('--rtl', action='append', help='slang argument file (-f) of the DUT RTL: run the covergroups '
-                    'on the design (repeatable)')
+    ap.add_argument('--rtl-config', help='TOML file describing the RTL run (top, filelists, binds, bind_tops, '
+                    'defines, clock, reset, reset_active_low, depth): run the covergroups on the design. '
+                    'See examples/rtl_config.toml; the --rtl-* options override its entries')
+    ap.add_argument('--rtl', action='append', help='slang argument file (-f) of the DUT RTL (repeatable)')
     ap.add_argument('--rtl-top', help='DUT module (its instance in the testbench top gives the connections)')
     ap.add_argument('--rtl-define', action='append', help='define for reading the RTL (repeatable)')
-    ap.add_argument('--rtl-depth', type=int, default=40, help='cycles explored from reset on the RTL')
-    ap.add_argument('--rtl-reset', help='DUT reset port (default: the input named like rst/reset)')
+    ap.add_argument('--rtl-depth', type=int, default=None, help='cycles explored from reset (default 40)')
+    ap.add_argument('--rtl-clock', action='append', help='DUT clock input port (repeatable)')
+    ap.add_argument('--rtl-reset', help='DUT reset input port')
+    ap.add_argument('--rtl-reset-low', type=lambda v: v.lower() in ('1', 'true', 'yes'), default=None,
+                    help='true: the reset is active low')
     ap.add_argument('--rtl-bind', action='append', help='slang argument file with the testbench\'s bind modules '
                     'and the checkers they bind into the DUT (repeatable)')
+    ap.add_argument('--rtl-bind-top', action='append', help='a bind module of --rtl-bind (repeatable)')
     ap.add_argument('--no-rtl-sva', dest='rtl_sva', action='store_false',
                     help='do not lower the concurrent SVA assumptions (svalower); yosys-slang then drops them')
-    ap.add_argument('--rtl-reset-low', type=lambda v: v.lower() in ('1', 'true', 'yes'), default=None,
-                    help='reset is active low (default: name ends in n / ni)')
     ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')
     a = ap.parse_args()
+    if a.rtl_config or a.rtl: load_rtl_config(a)      # before anything is written
     d = json.load(open(a.json))
     gen = Gen(d, a)
     gen.run()
@@ -4112,10 +4146,9 @@ def main():
                              'timeouts': tmo, 'unsat': unsat, 'covers': total, 'reached': reached, 'problems': probs}
     if a.witness:
         witness(gen, a.out)
-    if a.rtl:
-        if not a.rtl_top: sys.exit('--rtl needs --rtl-top')
+    if a.rtl_config or a.rtl:
         rtl_flow(gen, a.out)
-    if a.run or a.witness or a.rtl:
+    if a.run or a.witness or a.rtl_config or a.rtl:
         rep = summarize(gen)
         with open(os.path.join(a.out, 'report.json'), 'w') as f:
             json.dump(rep, f, indent=1, default=lambda o: sorted(o) if isinstance(o, set) else str(o))

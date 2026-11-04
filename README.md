@@ -154,11 +154,14 @@ objects are taken as true). `--covergroups REGEX` limits the run.
 ### Covergroups on the RTL: `--rtl`
 
 ```sh
-python fvgen.py tb.json -o fv/ --rtl rtl.f --rtl-top uart [--rtl-depth 40]
+python fvgen.py tb.json -o fv/ --rtl-config rtl_config.toml
 ```
 
-`rtl.f` holds the slang arguments of the DUT RTL (read with yosys-slang). fvgen builds a formal top
-with the DUT (inputs free, the reset port held for three cycles) and runs each covergroup whose
+The RTL setup comes from the user, in a TOML file (template: `examples/rtl_config.toml`; paths relative
+to it; `--rtl-*` options override its entries): `top` (the DUT module), `filelists` (slang `-f` files
+of the RTL, read with yosys-slang), `clock`, `reset`, `reset_active_low`, and optionally `binds` /
+`bind_tops` (the testbench's bind modules and checkers), `defines`, `depth`. fvgen builds a formal top
+with the DUT (inputs free, the reset held for three cycles) and runs each covergroup whose
 inputs it can trace into the design, sampled every cycle, so a bin is reached when the design ever
 holds that value. Inputs are traced from the extraction alone:
 

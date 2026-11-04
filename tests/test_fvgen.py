@@ -747,8 +747,28 @@ def test_rtl_covers():
     open(os.path.join(work, 'rtl.f'), 'w').write(os.path.join(HERE, 'rtl_dut.sv') + '\n')
     open(os.path.join(work, 'bind.f'), 'w').write(os.path.join(HERE, 'rtl_chk.sv') + '\n' +
                                                  os.path.join(HERE, 'rtl_bind.sv') + '\n')
-    run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl', 'rtl.f', '--rtl-bind', 'bind.f',
-         '--rtl-top', 'rf_dut', '--rtl-depth', '14'], cwd=work)
+    # the RTL setup comes from the user: a config file (paths relative to it)
+    os.makedirs(os.path.join(work, 'cfg'))
+    cfg = '''top = "rf_dut"
+filelists = ["../rtl.f"]
+binds = ["../bind.f"]
+bind_tops = ["rf_bind"]
+clock = "clk_i"
+reset = "rst_ni"
+reset_active_low = true
+depth = 14
+'''
+    open(os.path.join(work, 'cfg', 'rtl.toml'), 'w').write(cfg)
+    fv = [PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl-config', 'cfg/rtl.toml']
+    run(fv, cwd=work)
+    # what it needs is checked, with the DUT's ports when a name is wrong
+    open(os.path.join(work, 'cfg', 'bad.toml'), 'w').write(cfg.replace('reset = "rst_ni"\n', ''))
+    err = [PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv_err', '--rtl-config']
+    r = run(err + ['cfg/bad.toml'], cwd=work, check=False)
+    assert r.returncode and 'needs reset' in r.stderr, r.stderr
+    assert not os.path.exists(os.path.join(work, 'fv_err')), 'nothing is written before the config is checked'
+    r = run(err + ['cfg/rtl.toml', '--rtl-clock', 'clk'], cwd=work, check=False)
+    assert r.returncode and 'clk not an input port of rf_dut' in r.stderr and 'clk_i' in r.stderr, r.stderr
     rep = json.load(open(os.path.join(work, 'fv', 'report.json')))
     info = rep['rtl_info']
     assert (info['instance'], info['clock'], info['reset'], info['reset_active_low']) == \

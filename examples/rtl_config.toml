@@ -1,0 +1,20 @@
+# fvgen --rtl-config: how to read the DUT for running the testbench's covergroups on the RTL.
+# Paths are relative to this file. Command-line --rtl-* options override these entries.
+#
+#   python fvgen.py tb.json -o fv/ --rtl-config rtl_config.toml
+
+top       = "uart"                 # DUT module; its instance in the testbench top gives the connections
+filelists = ["rtl.f"]              # slang argument files (-f) of the RTL: sources, +incdir+, +define+
+
+# optional: the testbench's bind modules and the checkers they bind into the DUT. Only the checkers'
+# assumptions are used (they describe the interface, e.g. a protocol checker's legal bus traffic).
+binds     = ["bind.f"]
+bind_tops = ["uart_bind"]          # the bind modules among them
+
+defines   = []                     # extra defines for reading the RTL, e.g. ["FPGA=1"]
+
+clock     = ["clk_i"]              # DUT clock input(s)
+reset     = "rst_ni"               # DUT reset input
+reset_active_low = true
+
+depth     = 40                     # cycles explored from reset (optional, default 40)
