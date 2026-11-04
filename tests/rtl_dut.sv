@@ -23,4 +23,11 @@ module rf_dut (
   logic busy;                       // internal: tapped by the testbench
   assign busy = level_q > {2'b0, cfg_q};
   assign level_o = level_q;
+
+  // concurrent SVA (lowered by svalower for the formal runs): a driver rule as an assumption, an
+  // assertion that holds, one that fails (reading an empty FIFO keeps it empty), a cover sequence
+  cfg_never_3_M: assume property (@(posedge clk_i) disable iff (!rst_ni) cfg_we_i |-> cfg_wd_i != 2'd3);
+  level_max_A: assert property (@(posedge clk_i) disable iff (!rst_ni) level_q <= 4'd8);
+  read_empty_A: assert property (@(posedge clk_i) disable iff (!rst_ni) rd_i && !wr_i |=> level_q != 4'd0);
+  fill_C: cover property (@(posedge clk_i) disable iff (!rst_ni) level_q == 4'd7 ##1 level_q == 4'd8);
 endmodule

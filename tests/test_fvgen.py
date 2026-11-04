@@ -10,13 +10,14 @@
   T5  --rtl (tests/rtl_dut.sv, rtl_tb.sv): covergroup inputs traced to the DUT (port through a testbench net,
       internal net through a testbench assign, register field through the register model's HDL path);
       bins reached on the design at the cycles it allows, an impossible bin unreached, a testbench value unmapped
+  T6  svalower: lowered properties fail at exactly the same cycles as Verilator's native SVA on random traces
   T4  --witness / fv_replay.sv (tests/fv_witness.sv): every bin reached formally is hit in Verilator by the
       generated override class under several seeds; bins found unreachable are never hit by plain randomize()
 
     python tests/test_fvgen.py          (or pytest tests/)
 Needs yosys with the slang plugin, sby, verilator, iverilog.
 """
-import json, os, random, re, shutil, subprocess, sys, tempfile
+import collections, json, os, random, re, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -744,8 +745,10 @@ def test_rtl_covers():
     d = json.load(open(js))
     assert d['meta']['errors'] == 0, d['meta']['error_list']
     open(os.path.join(work, 'rtl.f'), 'w').write(os.path.join(HERE, 'rtl_dut.sv') + '\n')
-    run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl', 'rtl.f', '--rtl-top', 'rf_dut',
-         '--rtl-depth', '14'], cwd=work)
+    open(os.path.join(work, 'bind.f'), 'w').write(os.path.join(HERE, 'rtl_chk.sv') + '\n' +
+                                                 os.path.join(HERE, 'rtl_bind.sv') + '\n')
+    run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl', 'rtl.f', '--rtl-bind', 'bind.f',
+         '--rtl-top', 'rf_dut', '--rtl-depth', '14', '--rtl-asserts', '--rtl-assert-depth', '12'], cwd=work)
     rep = json.load(open(os.path.join(work, 'fv', 'report.json')))
     info = rep['rtl_info']
     assert (info['instance'], info['clock'], info['reset'], info['reset_active_low']) == \
@@ -761,11 +764,102 @@ def test_rtl_covers():
     assert rows['cov_cp_lvl__never']['status'] == 'unreached'
     # internal nets (probes): cfg_q is 0 out of reset and takes a written value one cycle later; busy
     # (level > cfg) needs a write first. A probe left unconnected would be free: everything at cycle 4
-    assert [rows[f'cov_cp_mode__auto_{v}'].get('step') for v in range(4)] == [4, 5, 5, 5]
+    # ... and the lowered assumption (config writes never use 3) keeps cfg_q from reaching 3
+    assert [rows[f'cov_cp_mode__auto_{v}'].get('step') for v in range(3)] == [4, 5, 5]
+    assert rows['cov_cp_mode__auto_3']['status'] == 'unreached'
     assert (rows['cov_cp_busy__auto_0'].get('step'), rows['cov_cp_busy__auto_1'].get('step')) == (4, 5)
     assert rows['cov_cp_x__one']['status'] == 'unmapped'
+    # concurrent SVA: lowered (DUT and bound checker), assertions checked under the assumption
+    sva = {x['name']: x['status'] for x in info['sva']}
+    assert sva == {'cfg_never_3_M': 'lowered', 'level_max_A': 'lowered', 'read_empty_A': 'lowered',
+                   'fill_C': 'lowered', 'full_hold_A': 'lowered'}, sva
+    assert info['tops'] == ['rf_dut', 'rf_bind'] and not info['multiclock']
+    asr = info['asserts']
+    # reading the empty FIFO right after reset (cycle 3) fails the check at the next edge, reported a step
+    # later as covers are (level 0 at cycle 4)
+    assert asr['failed'] == {'u_dut.read_empty_A': 5}, asr
     shutil.rmtree(work, ignore_errors=True)
     return len(rows)
+
+
+T6_PROPS = [
+    # (name, property); every property is an assert with an action block in the reference
+    ('imp', 'a |-> b'),
+    ('nxt', 'a |=> b'),
+    ('dly', 'a |-> ##2 (b || c)'),
+    ('ante', 'a ##1 b |-> c'),
+    ('chain', 'a ##1 b |=> ##1 (v != 4\'d0)'),
+    ('seq', 'b ##1 c'),
+    ('past', '(v == 4\'d5) |-> ($past(v) != 4\'d5)'),
+    ('past2', 'c |-> ($past(v, 2) <= v)'),
+    ('rose', '$rose(a) |=> !a'),
+    ('fell', '$fell(b) |-> c'),
+    ('stable', 'c |-> $stable(v)'),
+    ('changed', '$changed(v) |-> (a || b)'),
+    ('named', 'ab_S |-> ##1 c'),
+    ('andor', '(a and b) or c |-> v[0]'),
+]
+
+
+def test_sva_lowering_vs_verilator(n=3000, seed=11):
+    work = tempfile.mkdtemp(prefix='fvt6_')
+    def module(name, reference):
+        lines = [f'module {name} (input logic clk, input logic rst_n, input logic a, b, c, input logic [3:0] v);',
+                 '  sequence ab_S; a && !b; endsequence']
+        for nm, p in T6_PROPS:
+            act = f' else $display("R %0t {nm}", $time);' if reference else ';'
+            lines.append(f'  {nm}: assert property (@(posedge clk) disable iff (!rst_n) {p}){act}')
+        return '\n'.join(lines + ['endmodule']) + '\n'
+    open(os.path.join(work, 'ref.sv'), 'w').write(module('p_ref', True))
+    open(os.path.join(work, 'low_src.sv'), 'w').write(module('p_low', False))
+    open(os.path.join(work, 'low.f'), 'w').write(os.path.join(work, 'low_src.sv') + '\n')
+    run([PY, os.path.join(ROOT, 'svalower.py'), '-o', os.path.join(work, 'low'), '-f', os.path.join(work, 'low.f')])
+    rep = json.load(open(os.path.join(work, 'low', 'sva_report.json')))
+    assert {r['name']: r['status'] for r in rep} == {nm: 'lowered' for nm, _ in T6_PROPS}, rep
+    low = open(os.path.join(work, 'low', 'src', 'low_src.sv')).read()
+    # the lowered immediate assertions report like the reference's action blocks
+    low = re.sub(r'(\w+): assert \((.*)\);', r'if (!(\2)) $display("L %0t \1", $time);', low)
+    open(os.path.join(work, 'low.sv'), 'w').write(low)
+    tb = f'''
+module tb;
+  logic clk = 0, rst_n = 0, a = 0, b = 0, c = 0;
+  logic [3:0] v = 0;
+  p_ref r (.*);
+  p_low l (.*);
+  initial begin
+    int seed = {seed};
+    void'($urandom(seed));
+    repeat ({n}) begin
+      #5 clk = 1;
+      #1;                                   // inputs change after the edge, as a clocked driver
+      a = $urandom % 2; b = $urandom % 3 == 0; c = $urandom % 2; v = $urandom % 8;
+      rst_n = ($urandom % 40) != 0;          // occasional resets inside the run: disable iff
+      #4 clk = 0;
+    end
+    $finish;
+  end
+endmodule
+'''
+    open(os.path.join(work, 'tb.sv'), 'w').write(tb)
+    run(['verilator', '--binary', '--timing', '--assert', '-Wno-fatal', '-Wno-lint', '-Wno-style', '--top-module', 'tb',
+         'ref.sv', 'low.sv', 'tb.sv', '-o', 'vtb'], cwd=work)
+    r = run([os.path.join(work, 'obj_dir', 'vtb')], cwd=work, check=False)
+    # a property fails at a time when any of its attempts fails there (SVA may report several attempts;
+    # a lowered property with several consequent steps has several checks, name_<i>)
+    ref, lowd = set(), set()
+    base = {nm for nm, _ in T6_PROPS}
+    for line in r.stdout.splitlines():
+        m = re.match(r'\s*([RL]) (\d+) (\w+)', line)
+        if not m: continue
+        nm = m.group(3) if m.group(3) in base else re.sub(r'_\d+$', '', m.group(3))
+        (ref if m.group(1) == 'R' else lowd).add((int(m.group(2)), nm))
+    assert ref, r.stdout[-2000:]
+    only_ref, only_low = sorted(ref - lowd), sorted(lowd - ref)
+    assert not only_ref and not only_low, f'reference only: {only_ref[:6]}; lowered only: {only_low[:6]}'
+    names = {nm for _, nm in ref}
+    assert names == base, f'never failed (no evidence): {sorted(base - names)}'
+    shutil.rmtree(work, ignore_errors=True)
+    return len(ref), len(names)
 
 
 if __name__ == '__main__':
@@ -779,6 +873,8 @@ if __name__ == '__main__':
     print(f'R: {nm} modules from the regression sources, {nc} covers reached, one unsat set with its core')
     test_smoke_timeout()
     print('R: smoke timeout kills the solver process group')
+    nf, np_ = test_sva_lowering_vs_verilator()
+    print(f'T6: {nf} property failures at identical times in Verilator\'s SVA and the lowered form ({np_} properties)')
     nr = test_rtl_covers()
     print(f'T5: {nr} bins run on the RTL with their inputs traced to the design')
     n, nb = test_witness_replay()

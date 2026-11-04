@@ -3165,10 +3165,12 @@ class Job:
     """one SymbiYosys cover run: a top, the generated modules it needs (written next to it, so a job
     does not parse every module), and the covers it is responsible for"""
 
-    def __init__(self, d, top, src, mods, depth, defs, m, names=None, traces=False, pre='', post=''):
+    def __init__(self, d, top, src, mods, depth, defs, m, names=None, traces=False, pre='', post='',
+                 multiclock=False, mode='cover'):
         self.d, self.top, self.src, self.mods, self.depth, self.defs = d, top, src, mods, depth, defs
         self.m, self.names, self.traces = m, names, traces
         self.pre, self.post = pre, post     # yosys commands before reading the top / after flattening
+        self.multiclock, self.mode = multiclock, mode     # both clock edges: clk2fflogic; 'bmc': asserts
 
     PREP = ('hierarchy -smtcheck; scc -select; simplemap; select -clear; memory_nordff; async2sync; '
             'chformal -assume -early; opt_clean; formalff -setundef -clk2ff -ff2anyinit -hierarchy; '
@@ -3183,9 +3185,17 @@ class Job:
         wires = ' -wires' if self.traces else ''
         # probes into the DUT are connected right after flattening, before optimisation drops wires
         post = f'hierarchy -top {self.top}; proc; flatten; {self.post}; ' if self.post else ''
+        prep = self.PREP
+        if self.multiclock:     # as sby's multiclock mode: every clock edge is a step
+            prep = prep.replace('async2sync; chformal -assume -early; opt_clean; formalff -setundef -clk2ff '
+                                '-ff2anyinit -hierarchy; ', 'clk2fflogic; ')
+        if self.mode == 'bmc':
+            prep = prep.replace('chformal -live -fair -assert -remove', 'chformal -live -fair -cover -remove')
         ys = (f'{self.pre}read_verilog -sv -formal -DFORMAL{self.defs} -I{out_dir} {self.top}_lib.sv {self.top}.sv; '
-              f'{post}prep -top {self.top}; {self.PREP}; write_smt2{wires} {self.top}/model.smt2')
-        smt = ['yosys-smtbmc', '-s', gen.a.solver, '--presat', '--unroll', '-c', '--noprogress', '-t', str(self.depth)]
+              f'{post}prep -top {self.top}; {prep}; write_smt2{wires} {self.top}/model.smt2')
+        depth = self.depth * (2 if self.multiclock else 1)
+        smt = ['yosys-smtbmc', '-s', gen.a.solver, '--presat', '--unroll', '--noprogress', '-t', str(depth)]
+        smt += ['-c'] if self.mode == 'cover' else ['--keep-going']
         if self.traces: smt += ['--dump-vcd', f'{self.top}/trace%.vcd']
         return ['yosys', '-q', '-p', ys], smt + [f'{self.top}/model.smt2']
 
@@ -3518,8 +3528,9 @@ class RtlMap:
     instance and its port connections, the top's continuous assigns into the DUT, the register
     model's HDL paths, and the interface signals monitors copy into objects."""
 
-    def __init__(self, gen):
+    def __init__(self, gen, lowered=None):
         self.gen, self.d, self.a = gen, gen.d, gen.a
+        self.lowered = lowered
         self.notes = []
         self.tb = self.inst = None
         for top in self.d['hierarchy']:
@@ -3539,21 +3550,47 @@ class RtlMap:
         self.ports, self.nets = self.discover()
 
     def slang_args(self):
-        args = []
-        for f in self.a.rtl or []: args += ['-f', os.path.abspath(f)]
+        if getattr(self, 'lowered', None):      # concurrent SVA lowered (svalower): read the copies
+            args = ['-U', 'SYNTHESIS', '--ignore-timing', '-f', self.lowered]
+        else:
+            args = []
+            for f in (self.a.rtl or []) + (self.a.rtl_bind or []): args += ['-f', os.path.abspath(f)]
         for dfn in self.a.rtl_define or []: args.append(f'-D{dfn}')
         return ' '.join(args)
+
+    def tops(self):
+        """the DUT and the bind modules (modules in --rtl-bind files that contain bind directives)"""
+        out = [self.a.rtl_top]
+        for fl in self.a.rtl_bind or []:
+            for path in [l.strip() for l in open(fl) if l.strip() and not l.strip().startswith(('+', '-', '//'))]:
+                txt = open(path).read() if os.path.exists(path) else ''
+                for m in re.finditer(r'^\s*module\s+(\w+)(.*?)endmodule', txt, re.S | re.M):
+                    if re.search(r'^\s*bind\s', m.group(2), re.M) and m.group(1) not in out: out.append(m.group(1))
+        return out
+
+    def top_args(self):
+        return ' '.join(f'--top {t}' for t in self.tops())
 
     def discover(self):
         """the DUT's ports and internal signals (name -> width) as yosys-slang elaborates it"""
         with tempfile.TemporaryDirectory(prefix='fvrtl_') as d:
             js = os.path.join(d, 'dut.json')
             r = subprocess.run(['yosys', '-q', '-p', f'plugin -i slang; read_slang --single-unit {self.slang_args()} '
-                                f'--top {self.a.rtl_top}; write_json -noscopeinfo {js}'],
+                                f'{self.top_args()}; write_json -noscopeinfo {js}'],
                                capture_output=True, text=True)
             if r.returncode or not os.path.exists(js):
                 sys.exit('reading the DUT with yosys-slang failed:\n' + (r.stdout + r.stderr)[-2000:])
-            m = json.load(open(js))['modules'][self.a.rtl_top]
+            mods = json.load(open(js))['modules']
+            m = mods[self.a.rtl_top]
+        # both clock edges in the design (a negedge checker): the formal run needs multiclock mode
+        self.mixed_edges = False
+        for mm in mods.values():
+            pol = {c['parameters'].get('CLK_POLARITY') for c in mm['cells'].values()
+                   if c['type'] in ('$dff', '$adff', '$dffe', '$adffe', '$sdff', '$sdffe', '$dffsr', '$aldff')}
+            pol |= {'0' if c['type'].startswith('$_DFF_N') else '1' for c in mm['cells'].values()
+                    if c['type'].startswith('$_DFF_')}
+            pol = {str(x).lstrip('0') or '0' for x in pol if x is not None}
+            if len(pol) > 1: self.mixed_edges = True
         ports = {n: (p['direction'], len(p['bits'])) for n, p in m['ports'].items()}
         nets = {n: len(x['bits']) for n, x in m['netnames'].items() if not n.startswith('$')}
         return ports, nets
@@ -3669,16 +3706,50 @@ def rtl_flow(gen, out):
     """the DUT in the formal model: each covergroup whose inputs map to DUT signals is sampled
     every cycle on the RTL (DUT inputs free, reset held for the first cycles); every bin it can
     reach within --rtl-depth is reached by the design itself"""
-    rm = RtlMap(gen)
+    a = gen.a
     rd = os.path.join(out, 'rtl')
     os.makedirs(rd, exist_ok=True)
-    a = gen.a
+    lowered, sva = None, []
+    if a.rtl_sva:
+        import svalower
+        lowered, sva = svalower.lower_filelists((a.rtl or []) + (a.rtl_bind or []), os.path.join(rd, 'sva'),
+                                                a.rtl_define or [])
+    rm = RtlMap(gen, lowered)
+    mc = rm.mixed_edges
     clk = [p for p, (d, w) in rm.ports.items() if d == 'input' and w == 1 and re.search(r'clk|clock', p, re.I)]
     rst = a.rtl_reset or next((p for p, (d, w) in rm.ports.items() if d == 'input' and w == 1 and
                                re.search(r'rst|reset', p, re.I)), None)
     rst_low = a.rtl_reset_low if a.rtl_reset_low is not None else bool(rst and re.search(r'(_n|_ni|n)$', rst))
     gen.rtl_rows, gen.rtl_info = [], {'dut': a.rtl_top, 'instance': rm.dut_path, 'clock': clk, 'reset': rst,
-                                      'reset_active_low': rst_low, 'notes': rm.notes}
+                                      'reset_active_low': rst_low, 'notes': rm.notes, 'sva': sva,
+                                      'multiclock': mc, 'tops': rm.tops()}
+
+    def dut_top(name):
+        """formal top: clock (an input, or generated per global step in multiclock mode), reset held for
+        three cycles, every other DUT input free (registered at the rising edge in multiclock mode, as a
+        clocked driver would drive it)"""
+        lines = [f'module {name};' if mc else f'module {name} (input logic clk);']
+        if mc: lines += ["  logic clk = 1'b0;", '  always @($global_clock) clk <= !clk;']
+        lines += ["  logic [1:0] fv_rcnt = 2'd0;      // reset held for the first cycles",
+                  "  always_ff @(posedge clk) if (fv_rcnt != 2'd3) fv_rcnt <= fv_rcnt + 2'd1;",
+                  "  wire fv_rst = (fv_rcnt != 2'd3);"]
+        conns = []
+        for p, (d, w) in rm.ports.items():
+            if d == 'input':
+                if p in clk: conns.append(f'.{p}(clk)')
+                elif p == rst: conns.append(f".{p}({'!fv_rst' if rst_low else 'fv_rst'})")
+                elif mc:
+                    lines += [f'  (* anyseq *) logic [{w - 1}:0] fr_{p};', f"  logic [{w - 1}:0] in_{p} = '0;",
+                              f'  always_ff @(posedge clk) in_{p} <= fr_{p};']
+                    conns.append(f'.{p}(in_{p})')
+                else:
+                    lines.append(f'  (* anyseq *) logic [{w - 1}:0] in_{p};')
+                    conns.append(f'.{p}(in_{p})')
+            else:
+                lines.append(f'  wire [{w - 1}:0] out_{p};')
+                conns.append(f'.{p}(out_{p})')
+        lines.append(f'  {a.rtl_top} u_dut (' + ', '.join(conns) + ');')
+        return lines
     jobs = []
     for m in gen.mods_cg:
         if not m.hit_order: continue
@@ -3692,22 +3763,7 @@ def rtl_flow(gen, out):
                 gen.rtl_rows.append({'covergroup': m.name, 'cover': c, 'status': 'unmapped',
                                      'needs': sorted((deps.get(c) or set()) - mapped)})
         if not keep: continue
-        probes, lines = {}, [f'module fv_rtl_top (input logic clk);',
-                             "  logic [1:0] fv_rcnt = 2'd0;      // reset held for the first cycles",
-                             "  always_ff @(posedge clk) if (fv_rcnt != 2'd3) fv_rcnt <= fv_rcnt + 2'd1;",
-                             "  wire fv_rst = (fv_rcnt != 2'd3);"]
-        conns = []
-        for p, (d, w) in rm.ports.items():
-            if d == 'input':
-                if p in clk: conns.append(f'.{p}(clk)')
-                elif p == rst: conns.append(f".{p}({'!fv_rst' if rst_low else 'fv_rst'})")
-                else:
-                    lines.append(f'  (* anyseq *) logic [{w - 1}:0] in_{p};')
-                    conns.append(f'.{p}(in_{p})')
-            else:
-                lines.append(f'  wire [{w - 1}:0] out_{p};')
-                conns.append(f'.{p}(out_{p})')
-        lines.append(f'  {a.rtl_top} u_dut (' + ', '.join(conns) + ');')
+        probes, lines = {}, dut_top('fv_rtl_top')
         cg_conns = ['.clk(clk)', '.reset(fv_rst)', ".sample(!fv_rst)"]
         for port in m.port_order:
             if port in ('clk', 'reset', 'sample'): continue
@@ -3728,17 +3784,26 @@ def rtl_flow(gen, out):
             lines.append(f'  wire [{pw - 1}:0] v_{port} = {val};')
             cg_conns.append(f'.{port}(v_{port})')
         post = '; '.join(f'connect -nounset -set {pn} u_dut.{path}' for path, pn in probes.items())
-        pre = f'plugin -i slang; read_slang --single-unit {rm.slang_args()} --top {a.rtl_top}; '
+        pre = f'plugin -i slang; read_slang --single-unit {rm.slang_args()} {rm.top_args()}; '
         for lo, hi in [(i, min(i + a.cover_chunk, len(keep))) for i in range(0, len(keep), a.cover_chunk)]:
             names = keep[lo:hi]
             top = ident('rtl_' + m.name + (f'__{lo}' if len(keep) > a.cover_chunk else ''))
             src = '\n'.join(lines + [f'  {m.name} u_cg (' + ', '.join(cg_conns) + ');', 'endmodule']).replace(
                 'module fv_rtl_top', f'module {top}')
             jobs.append(Job(rd, top, src, [only_covers(m, names)], a.rtl_depth, ' -DFV_NO_ILLEGAL_BINS', m, names,
-                            pre=pre, post=post))
+                            pre=pre, post=post, multiclock=mc))
+    if a.rtl_asserts:       # the design's and the bound checkers' assertions, under their assumptions
+        pre = f'plugin -i slang; read_slang --single-unit {rm.slang_args()} {rm.top_args()}; '
+        jobs.append(Job(rd, 'rtl_asserts', '\n'.join(dut_top('rtl_asserts') + ['endmodule']), [], a.rtl_assert_depth,
+                        '', None, None, pre=pre, post='opt_clean', multiclock=mc, mode='bmc'))
     for j in jobs: j.write(gen)
     res = run_jobs(gen, jobs, a.jobs, on_done=lambda job, hits: {c: st for c, (_, st) in hits.items()})
+    gen.rtl_info['asserts'] = None
     for job, status, rch, unr, err, steps in res:
+        if job.mode == 'bmc':
+            gen.rtl_info['asserts'] = {'status': status, 'error': err, 'depth': a.rtl_assert_depth,
+                                       'failed': steps or {}}
+            continue
         for c in job.names:
             row = {'covergroup': job.m.name, 'cover': c}
             if c in rch: row.update(status='reached', step=(steps or {}).get(c))
@@ -3787,11 +3852,16 @@ def run_jobs(gen, jobs, n_jobs=8, on_done=None):
             elif 'Status: PASSED' in log or 'Status: FAILED' in log: status = 'PASS' if 'PASSED' in log else 'FAIL'
             else: status, err = 'ERROR', log[-800:]
         reached, unreached, pending, traces = {}, set(), [], {}
+        failed, step_now = {}, 0
         for line in log.splitlines():
+            mm = re.search(r'Checking assertions in step (\d+)', line)
+            if mm: step_now = int(mm.group(1))
+            mm = re.search(r'Assert failed in \S+: (\S+)', line)
+            if mm: failed.setdefault(mm.group(1), step_now // (2 if job.multiclock else 1))
             mm = re.search(r'Reached cover statement in step (\d+) at \S+: (\S+)', line)
             if mm:      # flattened designs name covers by instance path (u_cg.cov_x)
                 c = mm.group(2).split('.')[-1]
-                reached[c] = int(mm.group(1)); pending.append(c); continue
+                reached[c] = int(mm.group(1)) // (2 if job.multiclock else 1); pending.append(c); continue
             mm = re.search(r'Writing trace to VCD file: (\S+)', line)
             if mm:
                 for c in pending: traces[c] = os.path.join(sd, mm.group(1))
@@ -3809,6 +3879,7 @@ def run_jobs(gen, jobs, n_jobs=8, on_done=None):
             try: extra = on_done(job, {c: (traces.get(c), reached[c]) for c in rset})
             except Exception as e: err = (err or '') + f' (trace parsing: {e})'
         if not gen.a.keep: shutil.rmtree(jd, ignore_errors=True)
+        if job.mode == 'bmc': extra = failed
         return job, status, rset, unreached - rset, err, extra
 
     with ThreadPoolExecutor(n_jobs) as ex:
@@ -3868,6 +3939,25 @@ def report_md(rep):
                    'holds that value, whenever the testbench would sample it. **reached**: the design gets there; '
                    '**unreached**: not within the bound; **unmapped**: an input has no RTL counterpart.\n')
         for n in info.get('notes') or []: out.append(f'- note: {n}')
+        if info.get('multiclock'):
+            out.append('- the design uses both clock edges: multiclock mode (every edge a step; inputs change at the '
+                       'rising edge; cycles reported)')
+        sva = info.get('sva') or []
+        if sva:
+            cnt = {}
+            for x in sva: cnt[(x['kind'], x['status'])] = cnt.get((x['kind'], x['status']), 0) + 1
+            out.append('- concurrent SVA in the RTL and binds (lowered to immediate assertions: assumes constrain the '
+                       'runs): ' + ', '.join(f'{k} {st}: {n}' for (k, st), n in sorted(cnt.items())))
+            why = {}
+            for x in sva:
+                if x['why']: why[x['why'][:80]] = why.get(x['why'][:80], 0) + 1
+            for w, n in sorted(why.items(), key=lambda kv: -kv[1])[:12]: out.append(f'  - not lowered ({n}): {w}')
+        asr = info.get('asserts')
+        if asr:
+            out.append(f"- assertions checked {asr['depth']} cycles from reset under the assumptions: "
+                       f"{asr['status']}" + (f" ({asr['error']})" if asr.get('error') else ''))
+            for nm, st in sorted((asr.get('failed') or {}).items(), key=lambda kv: kv[1]):
+                out.append(f'  - **fails** at cycle {st}: `{nm}`')
         for mname, mp in (info.get('maps') or {}).items():
             out.append(f'- `{mname}` inputs:')
             for port, x in mp.items():
@@ -3975,6 +4065,13 @@ def main():
     ap.add_argument('--rtl-define', action='append', help='define for reading the RTL (repeatable)')
     ap.add_argument('--rtl-depth', type=int, default=40, help='cycles explored from reset on the RTL')
     ap.add_argument('--rtl-reset', help='DUT reset port (default: the input named like rst/reset)')
+    ap.add_argument('--rtl-bind', action='append', help='slang argument file with the testbench\'s bind modules '
+                    'and the checkers they bind into the DUT (repeatable)')
+    ap.add_argument('--no-rtl-sva', dest='rtl_sva', action='store_false',
+                    help='do not lower concurrent SVA (svalower); yosys-slang then drops it')
+    ap.add_argument('--rtl-asserts', action='store_true', help='also check the lowered assertions under the '
+                    'lowered assumptions (bounded, --rtl-assert-depth cycles)')
+    ap.add_argument('--rtl-assert-depth', type=int, default=20)
     ap.add_argument('--rtl-reset-low', type=lambda v: v.lower() in ('1', 'true', 'yes'), default=None,
                     help='reset is active low (default: name ends in n / ni)')
     ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')
