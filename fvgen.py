@@ -1741,6 +1741,24 @@ class Gen:
             CoverGen(self, cg).build()
         if self.a.witness: self.plan_witness()
 
+    def observed_fields(self):
+        """class member path -> where the testbench assigns it from interface signals (a monitor
+        copying DUT values into the object): such a field is not set by randomize()"""
+        if not hasattr(self, '_observed'):
+            self._observed = {}
+            for r in self.d['subroutines'] + self.d.get('procedures', []):
+                for w in (r.get('facts') or {}).get('field_writes', []):
+                    if w.get('rhs_vif') and w.get('member_path'):
+                        self._observed.setdefault(w['member_path'], f"{r.get('path') or r.get('name')} "
+                                                                    f"({r.get('file')}:{w.get('line')})")
+        return self._observed
+
+    def observed_where(self, cls, field):
+        for c in self.chain(cls):
+            w = self.observed_fields().get(f"{c['path']}::{field}")
+            if w: return w
+        return None
+
     def plan_witness(self):
         """for each covergroup whose sampled values are fields of a randomized class: that class's
         randomize() model (fv_r_) drives the covergroup, sampled the cycle after randomize. A port is
@@ -1751,6 +1769,7 @@ class Gen:
                 if getattr(cm, 'site', 1) is None and rm is not None and cm.cls['path'] == c['path']:
                     return cm, rm
             return None
+        self.witness_skipped = []
         for m in self.mods_cg:
             m.wit = None
             srcs = getattr(m.res, 'src', {})
@@ -1774,7 +1793,10 @@ class Gen:
                         ports[port] = ('free', None, 'not a field of ' + c['name']); continue
                     leaf = ident('__'.join(sc[1]))
                     vis = (props.get(sc[1][0]) or {}).get('visibility', '')
-                    if leaf in outs and 'local' not in str(vis).lower():
+                    obs = self.observed_where(c, sc[1][0]) if len(sc[1]) == 1 else None
+                    if obs:
+                        ports[port] = ('free', None, f"{'.'.join(sc[1])} is assigned from DUT signals in {obs}")
+                    elif leaf in outs and 'local' not in str(vis).lower():
                         ports[port] = ('pin', leaf, '.'.join(sc[1]))
                     elif leaf in outs:
                         ports[port] = ('free', leaf, f"{'.'.join(sc[1])} is local to {c['name']}: a derived class cannot constrain it")
@@ -1785,7 +1807,13 @@ class Gen:
                 if any(k == 'pin' for k, _, _ in ports.values()):
                     m.wit = {'cls': c, 'cm': cm, 'rm': rm, 'ports': ports}
                     m.wit['cond'] = self.sample_condition(m, c, rm)
+                else:
+                    self.witness_skipped.append((m.name, f"no input is a field randomize() sets in {c['name']}: " +
+                                                 '; '.join(sorted({why for _, _, why in ports.values()}))[:400]))
                 break
+            if m.wit is None and m.hit_order and not any(x[0] == m.name for x in self.witness_skipped):
+                self.witness_skipped.append((m.name, 'its inputs are not fields of a randomized class '
+                                                     '(interface/DUT signals, scalar sample() arguments)'))
 
     def sample_calls(self, cg):
         """(call node, [(kind, ...)] path conditions) for every <cg>.sample(...) in the testbench:
@@ -1959,6 +1987,7 @@ class CoverGen:
 
     def __init__(self, gen, cg):
         self.gen, self.cg = gen, cg
+        self.res_notes = {}         # id(bin) -> value resolution notes (LRM 19.5.7)
         owner = cg.get('owner') or cg['path'].rsplit('.', 1)[0]
         self.owner = owner
         self.mod = Module(gen.mod_names(f"fv_cg_{owner.split('::')[-1].split('.')[-1]}__{cg['name']}"), 'covergroup',
@@ -2104,11 +2133,23 @@ class CoverGen:
             ent = base_ent(b)
             try:
                 c, vals = self.bin_set(cp, cpinfo, b)
+                ent.setdefault('notes', []).extend(self.res_notes.get(id(b), []))
             except Unsupported as e:
                 ent['status'] = 'unsupported'; ent.setdefault('notes', []).append(str(e))
                 self.entries.append(ent); continue
+            if vals == [] and b.get('values'):
+                ent['notes'].append('no value left: the bin is empty (LRM 19.5.7)')
+                self.entries.append(ent); continue
+            # an iff that is constant (a parameter test) makes the bin unconditional, or inactive
+            iff_k = None
+            if b.get('iffExpr') is not None:
+                try: iff_k = self.tx.boolean(self.tx.scalar(b['iffExpr'])).k
+                except Unsupported: iff_k = None
+                if iff_k is not None and not iff_k.v:
+                    ent['notes'].append('iff condition is constant false: the bin never applies')
+                    self.entries.append(ent); continue
             excl.append(c)
-            if vals is not None and b.get('iffExpr') is None and b.get('withExpr') is None:
+            if vals is not None and (b.get('iffExpr') is None or iff_k is not None) and b.get('withExpr') is None:
                 excl_vals |= set(vals)
             if b['kind'] == 'IllegalBins':
                 self.illegal(f"{cp['name']}__{b['name']}", f'{iff} && {c}', ent)
@@ -2162,25 +2203,50 @@ class CoverGen:
         return cpinfo
 
     def values_of(self, cp, cpinfo, b):
-        """the bin's value list: [('v', K)] / [('r', K|None, K|None)] / [('e', S)] in source order"""
+        """the bin's value list: [('v', K)] / [('r', K|None, K|None)] / [('e', S)] in source order.
+        LRM 19.5.7: a constant is not truncated to the coverpoint type: a value outside the type's
+        range is removed, a range is clipped to it (noted in self.res_notes)"""
         out = []
         tx = self.tx
+        w, s = cpinfo['w'], cpinfo['s']
+        lo_t, hi_t = self.tmin_max(cpinfo)
+        notes = self.res_notes.setdefault(id(b), [])
+        def note(msg):
+            if msg not in notes: notes.append(msg)
+        tname = f"{w}-bit {'signed' if s else 'unsigned'}"
         for v in b.get('values') or []:
             vk = strip_conv(v)
             if vk.get('k') == 'ValueRange':
-                ends = []
+                ends, src = [], []
                 for side in ('left', 'right'):
                     e = vk[side]
-                    if strip_conv(e).get('k') == 'UnboundedLiteral': ends.append(None); continue
-                    c = nconst(e) or nconst(strip_conv(e))
-                    if c is None: ends.append(('e', tx.cast(tx.scalar(e), cpinfo['w'], cpinfo['s'])))
-                    else: ends.append(K(kval(c, cpinfo['w'], cpinfo['s']), cpinfo['w'], cpinfo['s'], c.x))
+                    if strip_conv(e).get('k') == 'UnboundedLiteral': ends.append(None); src.append(None); continue
+                    c = nconst(strip_conv(e)) or nconst(e)
+                    src.append(c)
+                    if c is None: ends.append(('e', tx.cast(tx.scalar(e), w, s)))
+                    else: ends.append(K(kval(c, w, s), w, s, c.x))
+                if all(c is None or not c.x for c in src) and all(isinstance(x, K) or x is None for x in ends):
+                    a = src[0].v if src[0] is not None else lo_t
+                    z = src[1].v if src[1] is not None else hi_t
+                    ca, cz = max(a, lo_t), min(z, hi_t)
+                    if a > z:
+                        note(f'[{a}:{z}] is an empty range: removed')
+                        continue
+                    if ca > cz:
+                        note(f'[{a}:{z}] is outside the coverpoint type ({tname}): removed (LRM 19.5.7)')
+                        continue
+                    if (ca, cz) != (a, z):
+                        note(f'[{a}:{z}] clipped to [{ca}:{cz}], the coverpoint type\'s range ({tname}, LRM 19.5.7)')
+                    ends = [None if src[0] is None and ca == lo_t else K(ca, w, s),
+                            None if src[1] is None and cz == hi_t else K(cz, w, s)]
                 out.append(('r', ends[0], ends[1]))
             else:
-                c = nconst(v)
+                c = nconst(strip_conv(v)) or nconst(v)
+                if c is not None and not c.x and not lo_t <= c.v <= hi_t:
+                    note(f'value {c.v} is outside the coverpoint type ({tname}): removed (LRM 19.5.7)')
+                    continue
                 if c is not None:
-                    out.append(('v', K(kval(c, cpinfo['w'], cpinfo['s']), cpinfo['w'], cpinfo['s'],
-                                       c.x & ((1 << cpinfo['w']) - 1))))
+                    out.append(('v', K(kval(c, w, s), w, s, c.x & ((1 << w) - 1))))
                 else:
                     r = tx.ex(v)
                     if isinstance(r, ARef):
@@ -2276,6 +2342,10 @@ class CoverGen:
             k = nconst(b['numberOfBinsExpr'])
             if k is None: raise Unsupported('bins [N]: N not constant')
             nbins = k.v
+        ent.setdefault('notes', []).extend(self.res_notes.get(id(b), []))
+        if not items and b.get('values'):
+            ent['notes'].append('no value left: the bin is empty and not created (LRM 19.5.7)')
+            return
         if not b['array']:
             c, _ = self.bin_set(cp, cpinfo, b)
             emit_bin(ident(b['name']), c, ent)
@@ -2850,7 +2920,8 @@ class SampleCondResolver:
         leaf = ident('__'.join(path))
         if n.get('w') is None:
             raise Unsupported(f"{'.'.join(path)} is not an integral field")
-        if leaf in self.outs:           # rand: the replay pins it
+        obs = self.gen.observed_where(self.cls, path[0]) if len(path) == 1 else None
+        if leaf in self.outs and not obs:   # rand: the replay pins it
             self.leaves[leaf] = ('.'.join(path), decl_width(self.outs[leaf]))
             return S('r_' + leaf, n['w'], bool(n.get('signed')), None, not n.get('signed'))
         # not rand: the object's state when it is randomized (the constraints may read it: q_, else free c_)
@@ -3259,12 +3330,13 @@ def write_replay(gen, out):
             enums = enum_names(w)
             row['when'] = [{path: enums.get(leaf, {}).get(val, val) for leaf, path, val, _ in g} for g in guards]
             row['steps'] = [{path: enums.get(leaf, {}).get(val, val) for leaf, path, val, _ in st} for st in steps]
-            row.update({'status': 'replay' if not others else 'partial', 'randomize_calls': len(steps),
+            status = 'replay' if not others else ('partial' if pins else 'uncontrollable')
+            row.update({'status': status, 'randomize_calls': len(steps),
                         'sampled_when': w['cond']['text'], 'assumed': w['cond']['notes'],
                         'needs': {p: {'kind': kinds[p][0], 'why': kinds[p][2],
                                       'values': [s.get(p) for s in hit['samples']]} for p in others}})
             rows.append(row)
-            if pins: by_cls.setdefault(w['cls']['path'], (w['cls'], []))[1].append((key, steps, guards, enums))
+            if pins and any(steps): by_cls.setdefault(w['cls']['path'], (w['cls'], []))[1].append((key, steps, guards, enums))
     text = replay_sv(gen, by_cls)
     with open(os.path.join(out, 'fv_replay.sv'), 'w') as f: f.write(text)
     with open(os.path.join(out, 'replay.json'), 'w') as f: json.dump(rows, f, indent=1)
@@ -3454,7 +3526,8 @@ def summarize(gen):
                        'covers': sum(len(e.get('covers', [])) for e in bins),
                        'asserts': sum(len(e.get('asserts', [])) for e in bins)},
             'entries': gen.report, 'smoke': getattr(gen, 'smoke_results', None),
-            'replay': getattr(gen, 'replay_rows', None)}
+            'replay': getattr(gen, 'replay_rows', None),
+            'witness_skipped': getattr(gen, 'witness_skipped', None)}
 
 
 def report_md(rep):
@@ -3483,13 +3556,16 @@ def report_md(rep):
                    '(UVM: `+uvm_set_type_override=<class>,<class>__fv_replay`; parameterized classes: '
                    '`<class>#(..)::type_id::set_type_override(fv_replay_pkg::<class>__fv_replay::get_type())`) plus '
                    '`+FV_HIT=<key>`. **replay**: the bin depends only on fields the override pins. **partial**: it also '
-                   'depends on values the override cannot set (listed: testbench state, monitor data). **unreached**: no '
-                   'sequence of randomize() calls within the bound reaches it under the constraints.\n')
+                   'depends on values the override cannot set (listed: testbench state, values the testbench copies from '
+                   'DUT signals). **uncontrollable**: it depends only on such values. **unreached**: no sequence of '
+                   'randomize() calls within the bound reaches it under the constraints, whatever those values are.\n')
         cnt = {}
         for r in rows: cnt[r['status']] = cnt.get(r['status'], 0) + 1
         out.append('- ' + ', '.join(f'{k}: {v}' for k, v in sorted(cnt.items())) + '\n')
+        for name, why in rep.get('witness_skipped') or []:
+            out.append(f'- covergroup `{name}`: no replay ({why})')
         for r in rows[:3000]:
-            if r['status'] in ('replay', 'partial'):
+            if r['status'] in ('replay', 'partial', 'uncontrollable'):
                 st = ' ; '.join('{' + ', '.join(f'{k}={v}' for k, v in x.items()) + '}' for x in r['steps'])
                 out.append(f"- **{r['status']}** `+FV_HIT={r['key']}` ({r['class']}, {r['randomize_calls']} randomize() "
                            f"calls): {st}")
@@ -3568,6 +3644,11 @@ def main():
     rep = write_outputs(gen, a.out)
     if a.run:
         res = run_jobs(gen, gen.smokes, a.jobs)
+        # guards reachable in a class's own module: dead at a call site only because of its inline
+        # constraints (expected: `with {m_txn_type == READ}` kills the write-only implications)
+        class_live = {job.m.cls['path']: rch for job, _, rch, _, _, _ in res
+                      if job.m.kind == 'constraints' and getattr(job.m, 'site', 1) is None}
+        site_dead = 0
         probs, reached, total, errs, unsat, tmo = [], 0, 0, 0, 0, 0
         for job, status, rch, unr, err, _ in res:
             m = job.m
@@ -3585,10 +3666,16 @@ def main():
                         for a in core)
                     probs.append(f'{m.name}: constraints unsatisfiable for every input{why}')
                 dead = sorted(x for x in unr if x.startswith('live_'))
-                for x in dead: probs.append(f'{m.name}: guard never true under the constraints: {x[5:]}')
+                live_cls = class_live.get(getattr(m, 'cls', {}).get('path')) if getattr(m, 'site', None) else None
+                for x in dead:
+                    if live_cls is not None and x in live_cls: site_dead += 1; continue
+                    probs.append(f'{m.name}: guard never true under the constraints: {x[5:]}')
             else:
                 total += len(rch) + len(unr); reached += len(rch)
                 for x in sorted(unr): probs.append(f'{m.name}: bin unreachable with free inputs: {x}')
+        if site_dead:
+            probs.append(f'({site_dead} guards are dead only at randomize() calls whose inline constraints exclude '
+                         'them; live in the class itself: not listed)')
         gen.smoke_results = {'modules': len({j.m.name for j in gen.smokes}), 'jobs': len(res), 'errors': errs,
                              'timeouts': tmo, 'unsat': unsat, 'covers': total, 'reached': reached, 'problems': probs}
     if a.witness:

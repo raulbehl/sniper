@@ -121,4 +121,30 @@ package ra_pkg;   // fvgen regressions from real testbenches; fv_regress_b.sv re
     endgroup
     function new(); cg = new(); endfunction
   endclass
+  // LRM 19.5.7: bin values outside the coverpoint type are removed, ranges clipped (core-v-verif
+  // uvma_cvxif cg_request cp_rs_valid on a 2-bit field; the LRM's own p1 example)
+  class vr_c;
+    localparam int W = 32;
+    rand bit [1:0] rs;
+    rand bit signed [2:0] p1;
+    covergroup cg;
+      cp_rs : coverpoint rs {
+        ignore_bins ign = {3'b111} with (1 == 1);
+        bins v2 = {2'b11};
+        bins v3 = {3'b111};
+      }
+      cp_p1 : coverpoint p1 { bins b1 = {1, [2:5], [6:10]}; bins b2 = {-1, [1:10], 15}; }
+      // a constant iff (cva6 uvme_axi_covg: ignore_bins IGN_SIZE3 = {3} iff (XLEN == 32))
+      cp_k : coverpoint rs { bins v[] = {[0:3]}; ignore_bins i3 = {3} iff (W == 32); ignore_bins i0 = {0} iff (W == 64); }
+    endgroup
+    function new(); cg = new(); endfunction
+  endclass
+  // dead constraint guards: g_site only at a call whose inline constraints exclude it (expected,
+  // not reported), g_cls in the class itself (reported)
+  class dg_c;
+    rand bit [3:0] k, v;
+    constraint g_site { (k == 1) -> v > 3; }
+    constraint g_cls { (k == 9) -> v == 0; k < 8; }
+    task body(); void'(this.randomize() with { k == 0; }); endtask
+  endclass
 endpackage

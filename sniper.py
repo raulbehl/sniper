@@ -402,16 +402,23 @@ def classify_ref(e):
         try: return bool(x.type.isClass)
         except Exception: return False
     via = any(is_cls(node.value) for node, _ in nodes)
+    # the written class member (declaring class path :: name): names are not unique across classes
+    def mpath(sym):
+        try: return sym.hierarchicalPath
+        except Exception: return None
+    last = mpath(nodes[-1][0].member) if nodes else None
     if chain and sk == 'ClassProperty' and via:
-        return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': chain[-1], 'via_handle': True}
+        return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': chain[-1], 'via_handle': True,
+                'member_path': last}
     if sk == 'ClassProperty':              # own property, or a member of an own struct property
-        return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': s.name, 'via_handle': False}
+        return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': s.name, 'via_handle': False,
+                'member_path': mpath(s)}
     if sk in ('Variable', 'Net') and root.kind.name == 'HierarchicalValue':
         return {'what': 'signal', 'path': text(e)}
     if chain and sk in ('Variable', 'FormalArgument') and via:
         # req.mem_id = id : write through a local/argument handle
         return {'what': 'field', 'path': '.'.join([s.name] + chain), 'field': chain[-1], 'via_handle': True,
-                'handle_kind': 'local' if sk == 'Variable' else 'arg'}
+                'handle_kind': 'local' if sk == 'Variable' else 'arg', 'member_path': last}
     if sk in ('Variable', 'Net'):
         try: procedural = s.parentScope.isProceduralContext
         except Exception: procedural = False
@@ -448,8 +455,24 @@ def analyse(body, loc, ser):
                              'vif_reads', 'signal_writes', 'signal_reads', 'field_writes', 'field_reads')}
     if body is None: return facts
     lhs_ids = set()
+    tainted = set()         # locals assigned (directly or through other locals) from interface signals
 
     def ln(x): return loc.line(x.sourceRange)
+
+    def reads_vif(e):
+        """the expression reads a virtual-interface signal, or a local holding one"""
+        found = []
+        def cb(n):
+            if found: return False
+            if isinstance(n, A.Expression) and n.kind.name in ('MemberAccess', 'NamedValue', 'HierarchicalValue'):
+                r = classify_ref(n)
+                if r is not None and ((r['what'] == 'vif' and r['signal']) or
+                                      (r['what'] == 'local' and r['path'].split('.')[0] in tainted)):
+                    found.append(True); return False
+            return True
+        try: e.visit(cb)
+        except Exception: pass
+        return bool(found)
 
     def fn(x):
         k = x.kind.name
@@ -465,6 +488,9 @@ def analyse(body, loc, ser):
             entry = {'line': ln(x), 'src': text(x, 200), 'nonblocking': x.isNonBlocking,
                      'rhs_const': const_str(x.right)}
             if r is None: return
+            if reads_vif(x.right):
+                entry['rhs_vif'] = True        # the value comes from the DUT (a monitor-style copy)
+                if r['what'] == 'local': tainted.add(r['path'].split('.')[0])
             if r['what'] == 'vif' and not r['signal']:      # vif = cfg.vif : handle assignment
                 facts['field_writes'].append({'what': 'field', 'path': r['handle'], 'field': r['handle'],
                                               'via_handle': False, 'vif_handle': True, **entry})

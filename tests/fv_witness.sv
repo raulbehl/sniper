@@ -1,5 +1,9 @@
 // fvgen --witness end to end (test_fvgen.py T4): bins reached formally from pkt's randomize()
 // model must be hit in simulation by fv_replay.sv's pkt__fv_replay under any seed.
+interface wt_if;
+  logic [2:0] src;
+endinterface
+
 package wt_pkg;
   typedef enum bit [1:0] {IDLE, RD, WR, CFG} kind_e;
 
@@ -9,6 +13,7 @@ package wt_pkg;
     rand bit [3:0] ch;
     rand bit par;
     bit [1:0] mode;              // testbench state: no constraint reads it
+    rand bit [2:0] src;          // rand, but the monitor overwrites it from the interface
     constraint c_len { kind == IDLE -> len == 0; kind != IDLE -> len inside {[1:200]}; }
     constraint c_ch { kind == CFG -> ch < 4; (kind == WR) -> (ch != len[3:0]); }
 `ifdef VERILATOR
@@ -29,11 +34,19 @@ package wt_pkg;
       cp_k : coverpoint kind;
       x_kc : cross cp_k, cp_ch { ignore_bins i = binsof(cp_k) intersect {IDLE}; }
       cp_mode : coverpoint mode { bins m3 = {3}; }
+      cp_src : coverpoint src { bins s5 = {5}; }
+      x_ks : cross cp_k, cp_src;
     endgroup
     function new(); cg = new(); endfunction
 `else
     function new(); endfunction
 `endif
+  endclass
+
+  // a monitor that copies a DUT value into the object: src is observed, not stimulus
+  class mon;
+    virtual wt_if vif;
+    function void observe(pkt p); p.src = vif.src; endfunction
   endclass
 
   // a coverage collector: covergroups sampled with the object, under conditions on a rand field

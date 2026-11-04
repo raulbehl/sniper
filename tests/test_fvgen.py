@@ -498,6 +498,13 @@ def test_regressions():
     assert 'fv_regress_a.sv:84 b > 10;' in unsat[0] and 'fv_regress_a.sv:85 b < 5;' in unsat[0]
     assert ':86' not in unsat[0]
 
+    # dead guards: reported in the class, not at a call that excludes them with inline constraints
+    dg_line = next(i for i, l in enumerate(open(os.path.join(HERE, 'fv_regress_a.sv')), 1) if 'k == 0;' in l)
+    dg = [p for p in sm['problems'] if 'dg_c' in p]
+    assert dg == ['fv_c_dg_c: guard never true under the constraints: g_cls_0',
+                  f'fv_c_dg_c__body_L{dg_line}: guard never true under the constraints: g_cls_0'], dg
+    assert any('dead only at randomize() calls' in p for p in sm['problems'])
+
     # same class / covergroup names in two packages, randomize() on the same line of two files:
     # unique module names, and each site uses its own package's class
     assert len(names) == len(set(names))
@@ -527,6 +534,22 @@ def test_regressions():
     wires = {l.split()[1]: l for l in xm.splitlines() if l.lstrip().startswith('wire h_y__')}
     assert "!((($unsigned(32'(cp_cp_c)) < 32'h2)))" in wires['h_y__lo__auto_0']      # values 0, 1 removed
     assert '!(' not in wires['h_y__hi__auto_0']
+
+    # LRM 19.5.7 value resolution: 3'b111 does not fit a 2-bit coverpoint, so the ignore bin and v3
+    # are empty and v2 stays; p1 (signed 3-bit, -4..3): b1 = {1, [2:3]}, b2 = {-1, [1:3]}
+    vr = module_text(V, 'fv_cg_vr_c__cg')
+    assert [h for h in rep['hit_order']['fv_cg_vr_c__cg'] if 'cp_rs' in h] == ['cov_cp_rs__v2']
+    assert "wire h_cp_rs__v2 = sample && 1'b1 && ((cp_cp_rs == 2'h3));" in vr
+    wires = {l.split()[1]: l for l in vr.splitlines() if l.lstrip().startswith('wire h_cp_p1')}
+    assert "((cp_cp_p1 == 3'sh1) || ((cp_cp_p1 >= 3'sh2) && (cp_cp_p1 <= 3'sh3)))" in wires['h_cp_p1__b1']
+    assert '6' not in wires['h_cp_p1__b1']
+    assert "(cp_cp_p1 == 3'sh7) || ((cp_cp_p1 >= 3'sh1) && (cp_cp_p1 <= 3'sh3))" in wires['h_cp_p1__b2']   # -1
+    assert [h for h in rep['hit_order']['fv_cg_vr_c__cg'] if 'cp_k' in h] == ['cov_cp_k__v__0', 'cov_cp_k__v__1',
+                                                                               'cov_cp_k__v__2']
+    vr_notes = [n for e in rep['entries'] if e.get('covergroup') == 'cg' and e.get('owner', '').endswith('vr_c')
+                for n in e.get('notes', [])]
+    assert any('value 7 is outside the coverpoint type (2-bit unsigned)' in n for n in vr_notes)
+    assert any('[6:10] is outside the coverpoint type' in n for n in vr_notes)
 
     # size() beyond --max-array: not capped (that made msg_c-style sets unsat); whole-array reads
     # hold only while size() <= 8; foreach constrains the modelled elements
@@ -608,8 +631,13 @@ def test_witness_replay(seeds=(1, 7, 1234), n_free=2000):
     assert set(rows) == set(order)
     # what the formal run must conclude: CFG implies ch < 4, mode is not rand
     assert rows['cov_x_kc__auto_CFG__hi']['status'] == 'unreached'
-    assert rows['cov_cp_mode__m3']['status'] == 'partial' and rows['cov_cp_mode__m3']['needs']['mode']['kind'] == 'free'
-    assert {r['status'] for c, r in rows.items() if c not in ('cov_x_kc__auto_CFG__hi', 'cov_cp_mode__m3')} == {'replay'}
+    assert rows['cov_cp_mode__m3']['status'] == 'uncontrollable' and rows['cov_cp_mode__m3']['needs']['mode']['kind'] == 'free'
+    # src is rand but the monitor assigns it from the interface: not stimulus, never pinned
+    assert rows['cov_cp_src__s5']['status'] == 'uncontrollable'
+    assert 'DUT signals' in rows['cov_cp_src__s5']['needs']['src']['why']
+    assert {r['status'] for c, r in rows.items() if c.startswith('cov_x_ks__')} == {'partial'}
+    assert {r['status'] for c, r in rows.items() if not c.startswith('cov_x_ks__') and
+            c not in ('cov_x_kc__auto_CFG__hi', 'cov_cp_mode__m3', 'cov_cp_src__s5')} == {'replay'}
     assert [st['kind'] for st in rows['cov_cp_kind__seq_rw']['steps']][-3:] == ['RD', 'WR', 'RD']
 
     # rd_cg is sampled only for RD packets (pinned with the bin), md_cg only when mode == 2 (testbench
@@ -643,15 +671,17 @@ module tb;
   {nl.join('  ' + x for x in decls)}
   {nl.join('  ' + x for x in inst)}
   initial begin
-    int calls, fails = 0, m = -1;
+    int calls, fails = 0, m = -1, src = -1;
     wt_pkg::pkt p;
     fv_replay_pkg::pkt__fv_replay r = new();
     p = r;                                   // the testbench only sees a pkt (factory override)
     if (!$value$plusargs("CALLS=%d", calls)) calls = 1;
     void'($value$plusargs("MODE=%d", m));
+    void'($value$plusargs("SRC=%d", src));
     for (int i = 0; i < calls; i++) begin
       p.mode = m >= 0 ? m : i % 4;          // testbench state, set before randomize()
       if (!p.randomize()) fails++;
+      if (src >= 0) p.src = src;            // the monitor's copy of the DUT value
       {' '.join(drive)}
       #1; {' '.join(f'a_{mod} |= s_{mod} ? h_{mod} : 0;' for mod in mods)}
       clk = 1; #1; clk = 0; #1;
@@ -678,7 +708,8 @@ endmodule
     checked = 0
     for key, r in rows_all.items():
         if r['status'] not in ('replay', 'partial'): continue
-        extra = [f"+MODE={r['needs']['mode']['values'][-1]}"] if 'mode' in r.get('needs', {}) else []
+        # values the override cannot set: the testbench (state) / the DUT via the monitor (src) supply them
+        extra = [f"+{p.upper()}={r['needs'][p]['values'][-1]}" for p in ('mode', 'src') if p in r.get('needs', {})]
         # guarded steps wait for a call in the witness state: allow a full mode cycle per step
         calls = r['randomize_calls'] * (4 if any(r.get('when') or []) else 1)
         for seed in seeds:
