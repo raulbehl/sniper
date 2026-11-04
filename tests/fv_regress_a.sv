@@ -103,4 +103,22 @@ package ra_pkg;   // fvgen regressions from real testbenches; fv_regress_b.sv re
       void'(std::randomize(v) with { v < 3; });
     endtask
   endclass
+  // cross ignore/illegal bins with a `with` filter: a product all of whose value combinations pass
+  // is not a bin (ibex exception_stall_instr_cross); one where only some do keeps the rest
+  class xw_c;
+    rand bit [1:0] a;
+    rand bit b;
+    rand bit [2:0] c;
+    covergroup cg;
+      cp_a : coverpoint a;
+      cp_b : coverpoint b;
+      cp_c : coverpoint c { bins lo = {[0:3]}; bins hi = {[4:7]}; }
+      x : cross cp_a, cp_b {
+        illegal_bins il = binsof(cp_a) intersect {[0:1]} with (cp_b == 1);
+        ignore_bins ig = binsof(cp_a) intersect {[2:3]} with (cp_a + cp_b == 3);
+      }
+      y : cross cp_c, cp_b { ignore_bins p = binsof(cp_c.lo) with (cp_c < 2); }
+    endgroup
+    function new(); cg = new(); endfunction
+  endclass
 endpackage

@@ -2117,6 +2117,7 @@ class CoverGen:
                 ent['notes'] = ['ignore bin: its values are removed from the other bins; no cover']
             self.entries.append(ent)
         ex_cond = ' && '.join(f'!{e}' for e in excl) if excl else None
+        cpinfo['excl'] = excl_vals
 
         def emit_bin(name, cond, ent, values=None):
             ivs = to_ivs(values)
@@ -2603,15 +2604,22 @@ class CoverGen:
             except Unsupported as e:
                 ent['status'] = 'unsupported'; ent['notes'] = [str(e)]
                 self.entries.append(ent); continue
+            whole = sel
             if b['kind'] in ('IgnoreBins', 'IllegalBins') and filt is not None:
-                # `with` selects value combinations, not whole products: the products stay, those
-                # combinations are removed from them (LRM 19.6.1.2)
-                for t in sel: partial.setdefault(t, []).append(filt)
+                # `with` selects value combinations, not whole products (LRM 19.6.1.2): a product whose
+                # every combination passes the filter is removed entirely (it is not a bin), one where
+                # only some do keeps the others
+                whole = set()
+                for t in sel:
+                    r = self.filter_on_tuple(b['crossSelectExpr']['filter'], tgt, t)
+                    if r == 'all': whole.add(t)
+                    elif r != 'none': partial.setdefault(t, []).append(filt)
             if b['kind'] == 'IgnoreBins':
-                if filt is None: ignored |= sel
-                ent['notes'] = [f'{len(sel)} products ignored' + (' where the with filter holds' if filt else '')]
+                ignored |= whole
+                ent['notes'] = [f'{len(sel)} products ignored' + (f' where the with filter holds ({len(whole)} entirely)'
+                                                                  if filt else '')]
             elif b['kind'] == 'IllegalBins':
-                if filt is None: illegal |= sel
+                illegal |= whole
                 if sel:
                     c = ' || '.join(self.tuple_cond(tgt, t) for t in sorted(sel))
                     if filt: c = f'({c}) && {filt}'
@@ -2650,6 +2658,47 @@ class CoverGen:
                 self.cover(f"{cx['name']}__{nm}", f'{base_cond} && {self.tuple_cond(tgt, t, partial)}', ent, at_least)
             ent.setdefault('notes', []).append(f'{len(auto)} automatic cross bins')
         self.entries.append(ent)
+
+    def filter_on_tuple(self, filt, tgt, t, limit=4096):
+        """'all' / 'none' / 'part' of the product's value combinations satisfy a cross `with`
+        filter (each coverpoint the filter names takes the values of its bin in the product); None
+        when the values are not known or too many to enumerate"""
+        names = set()
+        def refs(n):
+            if isinstance(n, dict):
+                sym = n.get('symbol') or {}
+                if n.get('k') == 'NamedValue' and sym.get('sym'): names.add(sym['sym'])
+                for v in n.values(): refs(v)
+            elif isinstance(n, list):
+                for v in n: refs(v)
+        refs(filt)
+        idx = [i for i, c in enumerate(tgt) if c['name'] in names]
+        sets = []
+        for i in idx:
+            b = tgt[i]['bins'][t[i]]
+            if b.values is None: return None
+            ex = tgt[i].get('excl', set())
+            vals = [v for lo, hi in b.values for v in range(lo, hi + 1) if v not in ex] \
+                if sum(hi - lo + 1 for lo, hi in b.values) <= limit else None
+            if vals is None: return None
+            sets.append(vals)
+        if math.prod(len(x) for x in sets) > limit: return None
+        tx, seen = self.tx, set()
+        saved = dict(tx.env)
+        try:
+            for combo in product(sets):
+                for i, v in zip(idx, combo):
+                    c = tgt[i]
+                    tx.env['#' + c['name']] = S(lit(v, c['w'], c['s']), c['w'], c['s'], K(v, c['w'], c['s']))
+                r = tx.boolean(tx.scalar(filt))
+                if r.k is None: return None
+                seen.add(bool(r.k.v))
+                if len(seen) == 2: return 'part'
+        except Unsupported:
+            return None
+        finally:
+            tx.env = saved
+        return 'all' if seen == {True} else 'none'
 
     def tuple_cond(self, tgt, t, partial=None):
         c = '(' + ' && '.join(tgt[i]['bins'][j].cond for i, j in enumerate(t)) + ')'

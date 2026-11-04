@@ -517,6 +517,17 @@ def test_regressions():
     assert 'cov_cp_n__b__0: cover (' in cg                      # labelled covers keep the bin name
     assert not any(l.lstrip().startswith(('y ', 'y\t')) for l in cg.splitlines())
 
+    # cross with-filtered ignore/illegal bins: wholly excluded products are not bins, partly
+    # excluded ones keep the other value combinations (every emitted bin is reachable: checked above)
+    xw = [h for h in rep['hit_order']['fv_cg_xw_c__cg'] if h.startswith(('cov_x__', 'cov_y__'))]
+    assert sorted(xw) == sorted(['cov_x__auto_0__auto_0', 'cov_x__auto_1__auto_0', 'cov_x__auto_2__auto_0',
+                                 'cov_x__auto_3__auto_1', 'cov_y__lo__auto_0', 'cov_y__lo__auto_1',
+                                 'cov_y__hi__auto_0', 'cov_y__hi__auto_1'])
+    xm = module_text(V, 'fv_cg_xw_c__cg')
+    wires = {l.split()[1]: l for l in xm.splitlines() if l.lstrip().startswith('wire h_y__')}
+    assert "!((($unsigned(32'(cp_cp_c)) < 32'h2)))" in wires['h_y__lo__auto_0']      # values 0, 1 removed
+    assert '!(' not in wires['h_y__hi__auto_0']
+
     # size() beyond --max-array: not capped (that made msg_c-style sets unsat); whole-array reads
     # hold only while size() <= 8; foreach constrains the modelled elements
     arr = module_text(C, 'fv_c_arr_c')
