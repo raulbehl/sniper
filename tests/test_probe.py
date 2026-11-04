@@ -117,6 +117,10 @@ def test_corpus_regressions():
     assert g['parameters'] == [{'name': 'N', 'value': '4', 'type': 'int'}]
     assert 'twice' in subs or any(s['name'] == 'twice' for s in d['subroutines'])
     assert not any(c['default_specialization'] for c in d['classes'] if c['name'] != 'gen_c')
+    # a specialization reached only through a typedef'd member type is reported
+    pc = next(c for c in d['classes'] if c['name'] == 'pred_c')
+    assert pc['parameters'] == [{'name': 'CFG_T', 'type_param': 'item'}] and not pc['default_specialization']
+    assert any(s['name'] == 'predict' for s in d['subroutines'])
     # code in a generate branch that is not elaborated is marked, not reported as invalid
     assert [(p['start'], p.get('uninstantiated')) for p in d['procedures']] == [(40, True)]
 

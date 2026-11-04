@@ -57,3 +57,13 @@ class gen_c #(int N = 4);
   constraint c_n { v < N; }
   function int twice(); return 2 * v; endfunction
 endclass
+
+// specialized only through a typedef used as a member type
+class pred_c #(type CFG_T);
+  CFG_T cfg;
+  function void predict(); endfunction
+endclass
+class env_c;
+  typedef pred_c #(.CFG_T(corpus_pkg::item)) pred_t;
+  pred_t pred;
+endclass

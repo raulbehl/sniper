@@ -697,7 +697,22 @@ class Extractor:
                 keep(self.proc_syms, key, s)
             elif k == 'CovergroupType':
                 keep(self.covergroups, key, s)
+            if k in ('ClassProperty', 'Variable', 'TypeAlias'):
+                follow_specialization(s)
             return A.VisitAction.Advance
+
+        def follow_specialization(s):
+            # the visitor does not enter class specializations reached only through a type
+            # (typedef pred_t = predictor#(cfg); pred_t pred;): visit own ones it would miss
+            try:
+                t = s.targetType.type if s.kind.name == 'TypeAlias' else s.type
+                ct = t.canonicalType
+                if ct.kind.name != 'ClassType' or ct.genericClass is None: return
+                p, l, _ = self.loc.resolve(ct.location)
+            except Exception:
+                return
+            if self.loc.is_own(p) and ('ClassType', p, l, ct.name) not in self.seen:
+                ct.visit(visit)
 
         first, generics = {}, []
 
