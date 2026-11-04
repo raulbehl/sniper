@@ -6,6 +6,7 @@
   T2  whole constraint sets vs Verilator's constraint solver, both directions: every solution Verilator
       finds satisfies the generated assumes, and tuples the assumes accept are accepted by Verilator
   T3  coverage: bins and transition monitors vs a reference model of LRM 19.5 on random sample traces
+  R   regressions from real testbenches (tests/fv_regress_a.sv, fv_regress_b.sv), smoke-run with sby
 
     python tests/test_fvgen.py          (or pytest tests/)
 Needs yosys with the slang plugin, sby, verilator, iverilog.
@@ -460,6 +461,127 @@ endmodule
     return n, len(names), never
 
 
+def regress_run(work, extra=()):
+    js = os.path.join(work, 'r.json')
+    run([PY, os.path.join(ROOT, 'sniper.py'), '--own', HERE, '-o', js, '--', '--top', 'fv_regress_top',
+         os.path.join(HERE, 'fv_regress_a.sv'), os.path.join(HERE, 'fv_regress_b.sv')])
+    out = os.path.join(work, 'fv')
+    r = run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', out, '--max-array', '8', *extra])
+    return out, json.load(open(os.path.join(out, 'report.json'))), r.stdout
+
+
+def module_text(path, name):
+    m = re.search(r'^module %s\b.*?^endmodule' % re.escape(name), open(path).read(), re.S | re.M)
+    assert m, f'module {name} not generated'
+    return m.group(0)
+
+
+def test_regressions():
+    work = tempfile.mkdtemp(prefix='fvreg_')
+    out, rep, _ = regress_run(work, ['--run', '-j', '8', '--timeout', '300'])
+    C, V = os.path.join(out, 'fv_constraints.sv'), os.path.join(out, 'fv_covers.sv')
+    mods = rep['modules']
+    names = mods['constraints'] + mods['randomizers'] + mods['covergroups']
+    ent = {(e.get('class'), e.get('block'), e.get('item')): e for e in rep['entries']
+           if e.get('kind') == 'constraint' and not e.get('site')}
+    sm = rep['smoke']
+
+    # every module reads (all files go into each smoke job) and every constraint set but `bad` is sat
+    assert sm['errors'] == 0 and sm['timeouts'] == 0, sm['problems']
+    assert sm['reached'] == sm['covers'] == rep['counts']['covers'], sm['problems']
+    unsat = [p for p in sm['problems'] if 'unsatisfiable' in p]
+    assert len(unsat) == 1 and unsat[0].startswith('fv_c_bad:'), sm['problems']
+    # ... and the report names the conflicting items, not the bystander c3 (line 86)
+    assert 'fv_regress_a.sv:84 b > 10;' in unsat[0] and 'fv_regress_a.sv:85 b < 5;' in unsat[0]
+    assert ':86' not in unsat[0]
+
+    # same class / covergroup names in two packages, randomize() on the same line of two files:
+    # unique module names, and each site uses its own package's class
+    assert len(names) == len(set(names))
+    assert {'fv_c_dup_2', 'fv_c_dup__body_L9_2', 'fv_cg_dup__cg_2'} <= set(names)
+    b_site = module_text(C, 'fv_c_dup__body_L9_2')
+    assert 'fv_regress_b.sv:4' in b_site and 'fv_regress_a.sv:4' not in b_site
+    # an empty inline block (`uvm_do_with(req, {})) still gives the site module
+    assert 'fv_c_dup__body_L14' in names
+
+    # unlabelled two-line coverpoint: named after its expression, no newline in the generated text;
+    # ignore_bins removed from the automatic bins; [4] bins split a 32-bit range by intervals
+    hits = rep['hit_order']['fv_cg_cov_c__cg']
+    assert [h for h in hits if h.startswith('cov_y__')] == [f'cov_y__auto_{v}' for v in range(8, 16)]
+    assert [h for h in hits if h.startswith('cov_cp_n__')] == [f'cov_cp_n__b__{i}' for i in range(4)]
+    cg = module_text(V, 'fv_cg_cov_c__cg')
+    assert "cp_n__b__1 = sample && 1'b1 && ((cp_cp_n >= 32'h40000000 && cp_cp_n <= 32'h7fffffff))" in cg
+    assert 'cov_cp_n__b__0: cover (' in cg                      # labelled covers keep the bin name
+    assert not any(l.lstrip().startswith(('y ', 'y\t')) for l in cg.splitlines())
+
+    # size() beyond --max-array: not capped (that made msg_c-style sets unsat); whole-array reads
+    # hold only while size() <= 8; foreach constrains the modelled elements
+    arr = module_text(C, 'fv_c_arr_c')
+    assert 'wire c_implicit_q__size = (q__size >= 0);' in arr
+    assert re.search(r"wire c_c_sum_0 = \(\(q__size > 32'sh8\) \|\| ", arr)
+    assert ent[('arr_c', 'c_sum', 0)]['status'] == 'approx'
+    assert ent[('arr_c', '<implicit>', 'q__size')]['status'] == 'approx'
+
+    # LRM 18.5.13: hard beats soft, derived soft beats base soft, decided exactly; state-dependent: approx
+    assert ent[('sd', 'c_s', 0)].get('assumes') is None and ent[('sd', 'c_s', 0)]['status'] == 'exact'   # m == 0
+    assert ent[('sd', 'c_s', 1)]['assumes'] and ent[('sd', 'c_s', 1)]['status'] == 'exact'               # k == 5
+    assert ent[('sd', 'c_s', 2)].get('assumes') is None                                                  # p == 1
+    assert ent[('sd', 'c_h2', 0)]['assumes']                                                             # p == 2
+    assert all(ent[('sb', 'c_s', i)]['assumes'] for i in range(3))
+    assert ent[('st_c', 'c', 1)]['status'] == 'approx' and ent[('st_c', 'c', 1)]['assumes']
+
+    # this.randomize() is the class's own randomize(), not randomize(this) with everything held
+    assert not any('tr_c__go' in n for n in names)
+    assert re.search(r'input logic \[3:0\] w\s*// rand ', module_text(C, 'fv_c_tr_c'))
+
+    # constraint_mode / rand_mode before the call and in new()
+    assert "parameter bit CM_c = 1'b0  // constraint_mode of dup::c: d.c.constraint_mode(0)" in \
+        module_text(C, 'fv_c_dup__run_L66')
+    assert re.search(r'input logic \[3:0\] y\s*// state dup\.y', module_text(C, 'fv_c_dup__run2_L71'))
+    assert "parameter bit CM_c_off = 1'b0" in module_text(C, 'fv_c_cm_c')
+    assert "parameter bit CM_c_on = 1'b1" in module_text(C, 'fv_c_cm_c')
+
+    # inline constraints reading the caller's variables become ports; another object's method is
+    # inlined; std::randomize modules have an atom order (used by --expose)
+    assert 'input logic signed [31:0] ctx__lim' in module_text(C, 'fv_c_dup__body_L102')
+    assert ent[('user_c', 'c', 0)]['status'] != 'unsupported'
+    assert any('get_k() inlined' in n for n in ent[('user_c', 'c', 0)]['notes'])
+    assert [a['block'] for a in rep['atom_order']['fv_c_std__user_c__body_L103']] == ['<std::randomize>']
+    # smoke job directories are removed (no --keep)
+    assert not [d for d in os.listdir(os.path.join(out, 'smoke')) if os.path.isdir(os.path.join(out, 'smoke', d))]
+    shutil.rmtree(work, ignore_errors=True)
+    return len(names), sm['covers']
+
+
+FAKE_SBY = """#!/bin/sh
+# hangs like a stuck solver, with a child process: the timeout must kill both
+mkdir -p "$(basename "$2" .sby)"
+( sleep 97 ) &
+sleep 97
+"""
+
+
+def test_smoke_timeout():
+    work = tempfile.mkdtemp(prefix='fvtmo_')
+    bindir = os.path.join(work, 'bin')
+    os.makedirs(bindir)
+    with open(os.path.join(bindir, 'sby'), 'w') as f: f.write(FAKE_SBY)
+    os.chmod(os.path.join(bindir, 'sby'), 0o755)
+    env_path = os.environ['PATH']
+    os.environ['PATH'] = bindir + os.pathsep + env_path
+    try:
+        out, rep, stdout = regress_run(work, ['--run', '-j', '16', '--timeout', '2', '--classes', '^(bad|dup)$'])
+    finally:
+        os.environ['PATH'] = env_path
+    sm = rep['smoke']
+    assert sm['modules'] > 0 and sm['timeouts'] == sm['modules'] and sm['errors'] == 0 and sm['unsat'] == 0
+    assert all('did not finish in 2s' in p for p in sm['problems'])
+    left = subprocess.run(['pgrep', '-f', 'sleep 97'], capture_output=True, text=True).stdout.split()
+    assert not left, f'solver processes left running: {left}'
+    assert not [d for d in os.listdir(os.path.join(out, 'smoke')) if os.path.isdir(os.path.join(out, 'smoke', d))]
+    shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == '__main__':
     n = test_expression_equivalence()
     print(f'T1: {n} expressions equivalent to slang')
@@ -467,3 +589,7 @@ if __name__ == '__main__':
     print(f'T2: {s} solver solutions satisfy the assumes; {acc} accepted / {rej} rejected candidates agree with the solver')
     n, nb, never = test_coverage_vs_reference()
     print(f'T3: {nb} covers match the reference on {n} random cycles (never hit, as in the reference: {never})')
+    nm, nc = test_regressions()
+    print(f'R: {nm} modules from the regression sources, {nc} covers reached, one unsat set with its core')
+    test_smoke_timeout()
+    print('R: smoke timeout kills the solver process group')

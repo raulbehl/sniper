@@ -168,6 +168,23 @@ def enum_name(v):
     return None
 
 
+def mode_call(x, name):
+    """obj.blk.constraint_mode(v) / obj.fld.rand_mode(v) / obj.constraint_mode(v): receiver object,
+    block or field (None: every one of the object's), new mode. The getter forms take no argument."""
+    v = x.arguments[-1]
+    out = {'receiver': None, 'member': None, 'value': const_str(v) or text(v)}   # literals are not always folded
+    if x.isSystemCall:              # block/field form: the first argument is the block or field
+        a0 = x.arguments[0]
+        if isinstance(a0, A.MemberAccessExpression):
+            out['receiver'], out['member'] = text(a0.value), a0.member.name
+        elif getattr(a0, 'symbol', None) is not None:     # blk.constraint_mode(v) inside the class
+            out['receiver'], out['member'] = 'this', a0.symbol.name
+    else:                           # object form: built-in class method
+        head = text(x).split('(')[0]
+        out['receiver'] = head.rsplit('.', 1)[0] if '.' in head else 'this'
+    return out
+
+
 def const_str(e):
     """Folded constant of an expression as text; string literals come back quoted."""
     try:
@@ -214,8 +231,11 @@ def type_info(t, depth=0):
             ti['size'] = abs(r.left - r.right) + 1
     elif ct.isClass:
         ti['class'] = ct.name
+        ti['class_path'] = ct.hierarchicalPath      # names are not unique across packages
         try:
-            if ct.genericClass is not None: ti['generic'] = ct.genericClass.name
+            if ct.genericClass is not None:
+                ti['generic'] = ct.genericClass.name
+                ti['generic_path'] = ct.genericClass.hierarchicalPath
         except Exception: pass
     return ti
 
@@ -458,6 +478,8 @@ def analyse(body, loc, ser):
             sr = x.subroutine
             if isinstance(sr, A.Symbol):
                 c['target'] = sr.hierarchicalPath
+            if name in ('constraint_mode', 'rand_mode') and x.arguments:
+                c.update(mode_call(x, name))
             facts['calls'].append(c)
             if name in RAND_SYSCALLS:
                 facts['rand_sites'].append({'kind': 'syscall', 'name': name, 'line': c['line'], 'src': text(x),
@@ -709,7 +731,7 @@ def trans_set(st, scope):
         vals = []
         for it in r.items:
             if not hasattr(it, 'kind') or it.kind.name == 'Comma': continue
-            if it.kind.name == 'OpenRangeExpression':
+            if it.kind.name in ('ValueRangeExpression', 'OpenRangeExpression'):
                 vals.append([syn_value(it.left, scope), syn_value(it.right, scope)])
             else:
                 vals.append(syn_value(it, scope))
@@ -1059,7 +1081,8 @@ class Extractor:
         x = cp.coverageExpr
         while x is not None and x.kind.name == 'Conversion': x = x.operand
         ti_src = x.type if x is not None and x.type.isEnum else cp.type
-        e = {'name': cp.name, **self.span(cp), 'type': str(cp.type), 'ti': type_info(ti_src),
+        # an unlabelled coverpoint's implicit name is its expression text, leading trivia included
+        e = {'name': cp.name.strip(), **self.span(cp), 'type': str(cp.type), 'ti': type_info(ti_src),
              'width': cp.type.bitWidth if cp.type.isIntegral else None,
              'options': option_entries(cp),
              'expr': self.ser.node(cp.coverageExpr) if cp.coverageExpr is not None else None,

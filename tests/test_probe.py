@@ -9,10 +9,10 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(HERE)
 
 
-def run_probe(src='probe_tb.sv', top='probe_top'):
+def run_probe(src='probe_tb.sv', top='probe_top', extra=()):
     out = os.path.join(tempfile.mkdtemp(), 'probe.json')
     subprocess.run([sys.executable, os.path.join(ROOT, 'sniper.py'), '--own', HERE, '-o', out, '--',
-                    '--top', top, os.path.join(HERE, src)], check=True, capture_output=True)
+                    '--top', top, *extra, os.path.join(HERE, src)], check=True, capture_output=True)
     with open(out) as f:
         return json.load(f)
 
@@ -125,7 +125,86 @@ def test_corpus_regressions():
     assert [(p['start'], p.get('uninstantiated')) for p in d['procedures']] == [(40, True)]
 
 
+
+EXT_PKG = """package fv_ext_pkg;
+  function automatic bit [7:0] ext_lim(int k);
+    return 8'(k * 3);
+  endfunction
+endpackage
+"""
+
+
+def test_fv_extraction():
+    """What fvgen reads: see tests/probe_fv.sv."""
+    ext = os.path.join(tempfile.mkdtemp(), 'fv_ext_pkg.sv')      # outside --own
+    with open(ext, 'w') as f: f.write(EXT_PKG)
+    d = run_probe('probe_fv.sv', 'fv_top', [ext])
+    assert d['meta']['errors'] == 0 and d['meta']['counts']['invalid_code'] == 0
+    it = next(c for c in d['classes'] if c['name'] == 'item')
+    ti = {p['name']: p['ti'] for p in it['properties']}
+    items = {i['src']: i['expr'] for b in it['constraints'] for i in b['items']}
+
+    # every expression node carries its SV width and signedness; implicit conversions are explicit
+    e = items["a + sa > 8'd3;"]
+    assert (e['w'], e['signed']) == (1, False)
+    add = e['left']
+    assert (add['w'], add['signed']) == (8, False)
+    assert (add['right']['k'], add['right']['operand']['w'], add['right']['operand']['signed']) == ('Conversion', 8, True)
+    # packed struct member: bit offset in the struct (ps_t = {hi[6:3], op[2:1], lo[0]})
+    e = items['ps.op == WR;']
+    assert (e['left']['k'], e['left']['offset'], e['left']['w']) == ('MemberAccess', 1, 2)
+    # enum values and parameters carry their constant
+    assert e['right']['const'] == "2'b1"
+    assert items['n < LIM;']['right']['operand']['const'] == '12'
+
+    # type_info: kind, width, sign, enum values, struct fields with offsets, element type and range
+    assert (ti['sa']['w'], ti['sa']['signed']) == (8, True)
+    assert [(x['name'], x['value']) for x in ti['op']['enum']] == [('RD', "2'b0"), ('WR', "2'b1"), ('AT', "2'b11")]
+    assert [(f['name'], f['offset'], f['type']['w']) for f in ti['ps']['fields']] == [('hi', 3, 4), ('op', 1, 2), ('lo', 0, 1)]
+    assert (ti['q']['kind'], ti['q']['elem']['w']) == ('QueueType', 4)
+    assert (ti['fx']['range'], ti['fx']['size'], ti['fx']['elem']['w']) == ([0, 3], 4, 4)
+
+    # functions called from constraints: own ones are reported anyway, others are added as external
+    subs = {s['name']: s for s in d['subroutines']}
+    assert 'twice' in subs and not subs['twice'].get('external')
+    assert subs['ext_lim'].get('external') is True and subs['ext_lim']['body']
+
+    # coverage: per-coverpoint option values; transitions parsed into steps (several sets in one bin,
+    # value ranges, [*m:n] / [->n] / [=n] repeats); an unlabelled coverpoint is named without trivia
+    cg = d['coverage']['covergroups'][0]
+    cps = {cp['name']: cp for cp in cg['coverpoints']}
+    assert set(cps) == {'cp_a', 'op'}
+    assert [(o['name'], o['type_option'], o['value']) for o in cps['cp_a']['options']] == [('at_least', False, '2')]
+    tr = {b['name']: b['trans'] for b in cps['cp_a']['bins']}
+    assert tr['t2'] == [[{'values': ['0']}, {'values': ['1']}], [{'values': ['2']}, {'values': ['3']}]]
+    assert tr['tr'] == [[{'values': ['1'], 'repeat': {'kind': '*', 'from': '2', 'to': '3'}},
+                         {'values': [['4', '5']]},
+                         {'values': ['6'], 'repeat': {'kind': '->', 'from': '1', 'to': '1'}},
+                         {'values': ['7'], 'repeat': {'kind': '=', 'from': '2', 'to': '2'}}]]
+    assert cps['op']['ti']['enum'][2]['name'] == 'AT'
+
+    # constraint_mode / rand_mode setters: receiver, block or field (None: the whole object), value
+    run = subs['run']['facts']['calls']
+    modes = [(c['name'], c['receiver'], c['member'], c['value'], c['line']) for c in run
+             if c['name'] in ('constraint_mode', 'rand_mode')]
+    assert modes == [('constraint_mode', 'it', 'c_off', '0', 44), ('rand_mode', 'it', 'n', '0', 45),
+                     ('constraint_mode', 'it', None, "1'b1", 46), ('rand_mode', 'it', None, "1'b0", 48)]
+
+
+def test_invalid_code():
+    """Code slang cannot bind is reported in facts.invalid and counted, not analysed."""
+    d = run_probe('probe_invalid.sv', 'invalid_top')
+    assert d['meta']['errors'] == 1 and d['meta']['counts']['invalid_code'] == 1
+    assert [str(e.get('code', e)) if isinstance(e, dict) else e for e in d['meta']['error_list']] == \
+        ['DiagCode(BadBinaryExpression)']
+    p = d['procedures'][0]
+    assert [i['line'] for i in p['facts']['invalid']] == [9]
+    assert p['facts']['signal_writes'] == []
+
+
 if __name__ == '__main__':
     test_probe()
     test_corpus_regressions()
+    test_fv_extraction()
+    test_invalid_code()
     print('probe tests passed')

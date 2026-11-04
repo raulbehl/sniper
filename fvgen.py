@@ -24,7 +24,7 @@ Generated (OUTDIR)
 Semantics follow IEEE 1800-2017 clauses 18 (constraints) and 19 (coverage); the report states every
 place where the formal model differs from simulation and in which direction.
 """
-import argparse, json, math, os, re, shutil, signal, subprocess, sys
+import argparse, json, math, os, re, shutil, signal, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -166,6 +166,7 @@ class Arr:
     def __init__(self, name, dims, ew, esigned, role, origin, ti=None, size_var=None, enum=None):
         self.name, self.dims, self.ew, self.esigned, self.role, self.origin = name, dims, ew, esigned, role, origin
         self.ti, self.size_var, self.enum = ti or {}, size_var, enum
+        self.trunc = False     # dynamic array whose size() can exceed the modelled maximum
 
     @property
     def n(self):
@@ -258,6 +259,7 @@ class Tx:
         self.env = {}          # symbol path -> S / ARef / ORef (foreach iterators, `item`, inlined args)
         self.refs = set()      # model variables referenced by the current atom
         self.notes = []        # approximations met while translating the current atom
+        self.trunc = set()     # truncated arrays the current atom reads beyond fixed positions
         self.depth = 0
         self.this_stack = []   # (class name, ORef) of methods being inlined
 
@@ -393,6 +395,16 @@ class Tx:
             t = f'{b.t}[({pos}) * {ew} +: {w}]'
         return S(f'$signed({t})' if s else t, w, s, None, not s)
 
+    def start(self):
+        """begin translating a new atom"""
+        self.refs, self.notes, self.trunc = set(), [], set()
+
+    def trunc_cond(self):
+        """true when a truncated array read by the current atom has elements past the model: the
+        atom is then not modelled and must not constrain anything (approx: over)"""
+        return ' || '.join(f'({a.size_var.name} > {lit(a.max, 32, True)})'
+                           for a in sorted(self.trunc, key=lambda a: a.name))
+
     def arr_index(self, a, seln, n):
         arr = a.arr
         dl, dr = arr.dims[a.depth]
@@ -414,7 +426,11 @@ class Tx:
             p = f'({st} - {lit(lo, 32, True)})'
             off = f'({a.off}) + {p} * {inner}' if a.off != '0' else f'{p} * {inner}'
             lim = arr.size_var.name if (a.depth == 0 and arr.size_var is not None) else lit(size, 32, True)
-            if a.depth == 0 and arr.size_var is not None: self.refs.add(arr.size_var.name)
+            if a.depth == 0 and arr.size_var is not None:
+                self.refs.add(arr.size_var.name)
+                if arr.trunc:
+                    self.trunc.add(arr); self.refs.add(arr.size_var.name)
+                    lim = f'(({lim}) < {lit(arr.max, 32, True)} ? ({lim}) : {lit(arr.max, 32, True)})'
             g = f'({p} >= 0 && {p} < {lim})'
             guard = g if guard is None else f'({guard} && {g})'
         if a.depth + 1 < len(arr.dims):
@@ -549,6 +565,7 @@ class Tx:
         arr = a.arr
         dims = arr.dims[a.depth:]
         out = []
+        if arr.trunc and a.depth == 0: self.trunc.add(arr)
         for idx in iter_dims(dims):
             x = a
             g = None
@@ -644,7 +661,7 @@ class Tx:
             this = self.ex(n['thisClass'])
             if not isinstance(this, ORef): raise Unsupported(f'{name}(): object not modelled')
         saved = dict(self.env)
-        cls_of = sub_path.rsplit('::', 1)[0].split('::')[-1] if '::' in sub_path else None
+        cls_of = sub_path.rsplit('::', 1)[0] if '::' in sub_path else None     # class path
         self.this_stack.append((cls_of, this))
         try:
             for i, f in enumerate(formals):
@@ -829,7 +846,8 @@ class ObjResolver:
         sk, path, nm = sym.get('skind'), sym.get('path', ''), sym['sym']
         if sk == 'ClassProperty' and tx.this_stack and tx.this_stack[-1][1] is not None:
             cls, this = tx.this_stack[-1]
-            chain = [c['name'] for c in self.gen.chain(self.gen.classes[cls])] if cls in self.gen.classes else [cls]
+            c0 = self.gen.cls(cls)
+            chain = [c['name'] for c in self.gen.chain(c0)] if c0 else [sev_key(cls)]
             if self.owns(path, chain):
                 return self.member(this, {**n, 'member': sym}, tx)
         if sk == 'ClassProperty' and self.owns(path, self.cls_chain):
@@ -870,22 +888,47 @@ def sev_key(cls_name):
 class Gen:
     def __init__(self, d, a):
         self.d, self.a = d, a
-        self.classes = {}
+        # class names are not unique across packages: look classes up with cls()
+        self.classes_by_path = {c['path']: c for c in d['classes'] if c.get('path')}
+        self.classes_by_name = {}
         for c in d['classes']:
-            self.classes.setdefault(c['name'], c)
+            self.classes_by_name.setdefault(c['name'], []).append(c)
         self.subs_by_path = {s['path']: s for s in d['subroutines']}
         self.report = []
         self.mods_c, self.mods_cg = [], []
         self.smokes = []
+        # every module goes into one file: same-named classes/covergroups of different packages, or
+        # randomize() sites on the same line of different files, get _2, _3, ...
+        self.mod_names = Namer()
 
     # ---- class model
+    def cls(self, name, ctx=None):
+        """the class a name refers to: an exact path, else the one in the package of the class `ctx`
+        (path) the reference is made from, else the only class of that name"""
+        if not name: return None
+        full = re.sub(r'#.*$', '', name)
+        if full in self.classes_by_path: return self.classes_by_path[full]
+        cands = self.classes_by_name.get(sev_key(name), [])
+        if len(cands) > 1 and ctx:
+            same = [c for c in cands if '::' in c['path'] and ctx.startswith(c['path'].rsplit('::', 1)[0] + '::')]
+            if same: return same[0]
+        return cands[0] if cands else None
+
+    def class_at(self, file, line):
+        """the innermost class whose source span contains file:line"""
+        best = None
+        for c in self.d['classes']:
+            if c.get('file') == file and (c.get('start') or 0) <= line <= (c.get('end') or -1):
+                if best is None or c['start'] >= best['start']: best = c
+        return best
+
     def chain(self, cls):
         """the class and its ancestors (own entries in the extraction), most-derived first"""
         out, c = [], cls
-        while c is not None and c['name'] not in [x['name'] for x in out]:
+        while c is not None and c['path'] not in [x['path'] for x in out]:
             out.append(c)
             b = c.get('base')
-            c = self.classes.get(sev_key(b)) if b else None
+            c = self.cls(b, c['path']) if b else None
         return out
 
     def find_function(self, n, res):
@@ -965,16 +1008,14 @@ class Gen:
                     if chain and prop is not None:
                         mx = self.max_size(chain, prop['name'])
                     cap = self.a.max_array
-                    if mx is None:
-                        if notes is not None:
-                            notes.append(f'{origin}: size() unbounded by unconditional constraints; '
-                                         f'modelled up to {cap} elements (approx: under)')
-                        mx = cap
-                    elif mx > cap:
-                        if notes is not None:
-                            notes.append(f'{origin}: size() can reach {mx}; modelled up to {cap} '
-                                         'elements (approx: under; raise --max-array)')
-                        mx = cap
+                    trunc = mx is None or mx > cap
+                    if trunc and notes is not None:
+                        notes.append(f'{origin}: size() ' + ('unbounded by unconditional constraints'
+                                                             if mx is None else f'can reach {mx}') +
+                                     f'; elements modelled up to {cap}, later ones free, constraints reading '
+                                     'the whole array hold only while size() <= ' + f'{cap} (approx: over; '
+                                     'raise --max-array)')
+                    if trunc: mx = cap
                     dims.append((0, max(mx - 1, 0)))
                 t = t.get('elem') or {}
             if 'w' not in t:
@@ -983,7 +1024,7 @@ class Gen:
             sv = Var(ident(name + '__size'), 32, True, role, origin + '.size()') if dyn else None
             arr = Arr(ident(name), dims, t['w'], t.get('signed', False), role, origin, ti, sv,
                       t.get('enum'))
-            if dyn: arr.max = dims[0][1] + 1
+            if dyn: arr.max, arr.trunc = dims[0][1] + 1, trunc
             return arr
         if k == 'UnpackedStructType':
             o = Obj(None, name + '__', role, origin)
@@ -993,7 +1034,8 @@ class Gen:
                 if x is not None: o.kids[f['name']] = x
             return o
         if k == 'ClassType':
-            cls = self.classes.get(sev_key(ti.get('generic') or ti.get('class', '')))
+            cls = self.cls(ti.get('generic_path') or ti.get('class_path') or ti.get('generic') or ti.get('class', ''),
+                           chain[0]['path'] if chain else None)
             if cls is None or depth > 3:
                 if notes is not None and role == 'rand':
                     notes.append(f'{origin}: rand object of class {ti.get("class")} not in the extraction; '
@@ -1034,7 +1076,7 @@ class Gen:
                 res.ctx_vars[key] = Var(ident('ctx__' + nm), n['w'], bool(n.get('signed')), 'state',
                                         f"caller {sym.get('path', nm)}")
             else:
-                cls = self.classes.get(sev_key(n.get('ty', '')))
+                cls = self.cls(n.get('ty', ''), sym.get('path'))
                 o = Obj(cls, 'ctx__' + nm + '__', 'state', f"caller {sym.get('path', nm)}")
                 res.ctx_vars[key] = o
         return res.ctx_vars[key]
@@ -1056,12 +1098,13 @@ class Gen:
         chain = self.chain(cls)
         suffix = ''
         if site is not None: suffix = '__' + site['tag']
-        mname = ident('fv_c_' + cls['name'] + suffix)
+        mname = self.mod_names('fv_c_' + cls['name'] + suffix)
         mod = Module(mname, 'constraints', f"constraints of class {cls['name']} ({cls['file']}:{cls['start']})"
                      + (f"; randomize() at {site['where']}: {site['src']}" if site else ''))
         notes = []
         root = self.build_obj(mod, cls, '', 'rand', cls['name'], 0, notes)
         rand_filter = site.get('args') if site else None
+        cm_mode, rand_mode = self.modes(chain, site)
         res = ObjResolver(self, mod, root, root.chain)
         res.cls_objs = chain
         atoms, entries = [], []
@@ -1084,7 +1127,10 @@ class Gen:
             pname = ident('CM_' + (o.prefix + b['name'] if o is not root else b['name']))
             if pname not in cm_params:
                 cm_params[pname] = True
-                mod.params.append((pname, "1'b1", f"constraint_mode of {c['name']}::{b['name']}"))
+                on, why = (True, None)
+                if o is root: on, why = cm_mode.get(b['name'], cm_mode.get(None, (True, None)))
+                mod.params.append((pname, "1'b1" if on else "1'b0", f"constraint_mode of {c['name']}::{b['name']}" +
+                                   (f": {why}" if why else '')))
             sub_res = res if o is root else ObjResolver(self, mod, o, o.chain)
             sub_res.cls_objs = self.chain(o.cls)
             sub_tx = tx if o is root else Tx(mod, sub_res, self)
@@ -1103,7 +1149,7 @@ class Gen:
             ctx_tx = Tx(mod, caller_res, self)
             res.ctx_vars = caller_res.ctx_vars      # the caller's state becomes ports below
             inl = site['inline']
-            items = inl['list'] if inl.get('k') == 'List' else [inl]
+            items = inl.get('list', []) if inl.get('k') == 'List' else [inl]
             disabled_soft = set()
             for i, it in enumerate(items):
                 ent = {'kind': 'constraint', 'class': cls['name'], 'block': '<inline>', 'item': i,
@@ -1115,9 +1161,10 @@ class Gen:
             # constraints on fields the inline constraints constrain (or name in disable soft).
             inl_refs = set().union(*[a['refs'] for a in atoms if a['param'] == 'INLINE_EN' and not a['soft']] or [set()])
             for a in atoms:
-                if a['soft'] and a['param'] != 'INLINE_EN' and (a['refs'] & inl_refs or a['refs'] & disabled_soft):
-                    a['dropped'] = 'soft constraint overridden by the call site\'s inline constraints'
-                    a['entry'].setdefault('notes', []).append(a['dropped'] + ' (approx: exact when they conflict)')
+                if a['soft'] and a['param'] != 'INLINE_EN' and a['refs'] & disabled_soft:
+                    a['dropped'] = 'disable soft at the call site'
+                elif a['soft'] and a['param'] != 'INLINE_EN' and a['refs'] & inl_refs:
+                    a['inline_override'] = True     # fallback when resolve_soft cannot decide
         # randomize(a, b): only the listed fields are random, the rest are held state (LRM 18.11)
         rand_names = None
         if rand_filter is not None:
@@ -1127,6 +1174,22 @@ class Gen:
                 if x is None: continue
                 for v in leaves(x): rand_names.add(v.name)
                 if isinstance(x, Arr) and x.size_var is not None: rand_names.add(x.size_var.name)
+        # rand_mode(0): the field keeps its value, the constraints still apply to it (LRM 18.8)
+        off = {nm for nm, (on, _) in rand_mode.items() if not on and nm is not None}
+        if rand_mode.get(None, (True,))[0] is False:
+            off |= {k for k in root.kids if (rand_mode.get(k) or (False,))[0] is False}
+        off_vars = set()
+        for nm in off:
+            x = root.kids.get(ident(nm))
+            if x is None: continue
+            for v in leaves(x): off_vars.add(v.name)
+            if isinstance(x, Arr) and x.size_var is not None: off_vars.add(x.size_var.name)
+        if off_vars:
+            if rand_names is None:
+                rand_names = {v.name for v in leaves(root) if v.role == 'rand'}
+                rand_names |= {x.size_var.name for x in leaves(root) if isinstance(x, Arr) and x.size_var is not None}
+            rand_names -= off_vars
+            notes.append('rand_mode(0) before the call: ' + ', '.join(sorted(off)) + ' held (state)')
         # implicit constraints of the rand fields
         for v in leaves(root):
             if v.role != 'rand' or (rand_names is not None and v.name not in rand_names): continue
@@ -1149,12 +1212,15 @@ class Gen:
                 ent['status'] = 'exact'
                 entries.append(ent)
             if isinstance(v, Arr) and v.size_var is not None:
+                # size() <= max is implied by the constraints unless the model is truncated; a truncated
+                # model must not cap size(), or the constraints that need more elements become unsat
                 ent = {'kind': 'constraint', 'class': cls['name'], 'block': '<implicit>', 'item': v.size_var.name,
-                       'src': f'{v.origin}: 0 <= size() <= {v.max} (bounded model of a dynamic array)',
+                       'src': f'{v.origin}: 0 <= size()' + (f' (elements past {v.max} not modelled)' if v.trunc
+                                                            else f' <= {v.max}'),
                        'file': cls['file'], 'line': None, 'site': site['where'] if site else None}
-                self.add_atom(atoms, ent, f"({v.size_var.name} >= 0 && {v.size_var.name} <= {lit(v.max, 32, True)})",
-                              {v.size_var.name}, False, None, 'bound')
-                ent['status'] = 'approx'
+                bound = f"{v.size_var.name} >= 0" + ('' if v.trunc else f" && {v.size_var.name} <= {lit(v.max, 32, True)}")
+                self.add_atom(atoms, ent, f"({bound})", {v.size_var.name}, False, None, 'bound')
+                ent['status'] = 'approx' if v.trunc else 'exact'
                 entries.append(ent)
         # ports
         mod.port('input', 'logic clk', 'clk')
@@ -1174,6 +1240,7 @@ class Gen:
                      ('rand ' if is_rand else 'state ') + v.origin +
                      (f' [{"][".join(f"{a}:{b}" for a, b in v.dims)}] x {v.ew}b' if isinstance(v, Arr) else ''))
             v.is_rand = is_rand
+        self.resolve_soft(mod, atoms)
         # assumes
         for a in atoms:
             if a.get('dropped'): continue
@@ -1184,7 +1251,8 @@ class Gen:
             if a['param']: en = f"(en && {a['param']})"
             if a['soft']:
                 if 'SOFT_EN' not in [p[0] for p in mod.params]:
-                    mod.params.append(('SOFT_EN', "1'b1", 'soft constraints, as hard (approx: under if one would be dropped)'))
+                    mod.params.append(('SOFT_EN', "1'b1", 'soft constraints the solver keeps (LRM 18.5.13; see report); '
+                                       '0: none'))
                 en = f'({en} && SOFT_EN)'
             an = mod.names('a_' + a['name'])
             a['assume'] = an
@@ -1220,6 +1288,92 @@ class Gen:
         mod.ctx_vars = res.ctx_vars
         return mod
 
+    def resolve_soft(self, mod, atoms):
+        """LRM 18.5.13: the solver keeps a soft constraint unless it conflicts with the hard
+        constraints and the higher-priority soft constraints it kept (priority: inline over class,
+        derived over base, later over earlier; `atoms` is in increasing priority). When the atoms
+        involved read only rand variables that is a constant, decided here with yosys `sat`; when
+        they read testbench state it depends on the state: kept as hard (approx: under) unless no
+        state allows it, or an inline constraint of the call site constrains the same field.
+        Decided with every constraint_mode on."""
+        softs = [a for a in atoms if a['soft'] and not a.get('dropped')]
+        if not softs: return
+        rand = {nm for nm in mod.ports if (mod.ports[nm][2] or '').startswith('rand ')}
+        live = [a for a in atoms if not a.get('dropped')]
+        # connected components over shared rand variables
+        parent = {}
+        def find(x):
+            while parent.setdefault(x, x) != x: x = parent[x]
+            return x
+        for a in live:
+            rs = sorted(a['refs'] & rand)
+            for r in rs[1:]: parent[find(r)] = find(rs[0])
+        def comp(a):
+            rs = a['refs'] & rand
+            return find(min(rs)) if rs else None
+        groups = {}
+        for a in live: groups.setdefault(comp(a) or id(a), []).append(a)
+        for grp in groups.values():
+            gs = [a for a in grp if a['soft']]
+            if not gs: continue
+            hard = [a for a in grp if not a['soft']]
+            stateful = any(a['refs'] - rand for a in grp)
+            def note(a, msg, status=None):
+                a['entry'].setdefault('notes', []).append(msg)
+                if status and a['entry'].get('status', 'exact') == 'exact': a['entry']['status'] = status
+            if not stateful and self.sat(mod, hard + gs):
+                for a in gs: note(a, 'soft constraint kept: consistent with all other constraints (LRM 18.5.13)')
+                continue
+            kept = []
+            for a in reversed(gs):                       # highest priority first
+                r = self.sat(mod, hard + kept + [a])
+                if r is False:
+                    a['dropped'] = 'soft constraint conflicts with higher-priority constraints (LRM 18.5.13)'
+                    note(a, a['dropped'] + ('' if not stateful else ' for every value of the state it reads'))
+                elif r is True and not stateful:
+                    kept.append(a)
+                    note(a, 'soft constraint kept: consistent with the higher-priority constraints (LRM 18.5.13)')
+                elif a.get('inline_override'):
+                    a['dropped'] = 'soft constraint overridden by the call site\'s inline constraints'
+                    note(a, a['dropped'] + ' (approx: exact when they conflict)', 'approx')
+                else:
+                    kept.append(a)
+                    note(a, 'soft constraint kept as hard: whether the solver drops it depends on testbench '
+                            'state' + (' (sat check timed out)' if r is None else '') + ' (approx: under)', 'approx')
+
+    def sat(self, mod, atoms):
+        """are the atoms' conditions satisfiable together (all inputs free)? None: undecided"""
+        if not atoms: return True
+        key = tuple(sorted(a['cond'] for a in atoms))
+        cache = self.__dict__.setdefault('sat_cache', {})
+        if key in cache: return cache[key]
+        ports = [f"  input {mod.ports[nm][1]}," for nm in mod.port_order if nm not in ('clk', 'reset', 'en')]
+        params = ''.join(f'  localparam bit {p} = {d};\n' for p, d, _ in mod.params)
+        src = ('module fv_sat_chk (\n' + '\n'.join(ports) + '\n  output ok\n);\n' + params + '\n'.join(mod.temps) +
+               '\n  assign ok = ' + ' && '.join(f"({a['cond']})" for a in atoms) + ';\nendmodule\n')
+        with tempfile.TemporaryDirectory(prefix='fvsat_') as d:
+            with open(os.path.join(d, 'chk.sv'), 'w') as f: f.write(src)
+            try:
+                r = subprocess.run(['yosys', '-q', '-p', 'read_verilog -sv chk.sv; prep -top fv_sat_chk; '
+                                    f'tee -o sat.log sat -set ok 1 -timeout {self.a.sat_timeout}'],
+                                   cwd=d, capture_output=True, text=True, timeout=self.a.sat_timeout + 30)
+                log = open(os.path.join(d, 'sat.log')).read() if os.path.exists(os.path.join(d, 'sat.log')) else ''
+            except subprocess.TimeoutExpired:
+                log = ''
+        res = True if 'model found:' in log else (False if 'no model found' in log else None)
+        cache[key] = res
+        return res
+
+    def unsat_core(self, mod):
+        """a minimal set of the module's assumes that cannot hold together (deletion-based), or None"""
+        core = list(mod.atom_order)
+        if self.sat(mod, core) is not False: return None
+        i = 0
+        while i < len(core):
+            if self.sat(mod, core[:i] + core[i + 1:]) is False: del core[i]
+            else: i += 1
+        return core
+
     def add_atom(self, atoms, ent, cond, refs, soft, param, kind='item', guard=None):
         base = f"{ent['block']}_{ent['item']}".replace('<', '').replace('>', '')
         atoms.append({'name': base, 'cond': cond, 'refs': set(refs), 'soft': soft, 'param': param,
@@ -1236,13 +1390,21 @@ class Gen:
             if level == 'info': return
             if level == 'unsupported' or status[0] == 'exact': status[0] = level
 
+        def trunc_guard(p):
+            """a guard that reads a truncated array is false past the model, dropping what it guards"""
+            tc = tx.trunc_cond()
+            if not tc: return p
+            note('guard reads a dynamic array past its modelled elements: the guarded constraints hold only '
+                 'while size() <= the model maximum (approx: over)')
+            return f'(!({tc}) && {p})'
+
         def walk(n, guards, soft):
             k = n['k']
             if k == 'List':
-                for x in n['list']: walk(x, guards, soft)
+                for x in n.get('list', []): walk(x, guards, soft)
             elif k == 'Expression':
                 s = soft or n.get('isSoft', False)
-                tx.refs = set(); tx.notes = []
+                tx.start()
                 try:
                     e = tx.boolean(tx.scalar(n['expr']))
                 except Unsupported as ex:
@@ -1251,30 +1413,35 @@ class Gen:
                 for m in tx.notes: note(m)
                 refs = set(tx.refs) | set().union(*[g[1] for g in guards] or [set()])
                 cond = e.t
+                if tx.trunc:
+                    note('reads a dynamic array past its modelled elements: holds only while size() <= '
+                         'the model maximum (approx: over)')
+                    cond = f'({tx.trunc_cond()} || {cond})'
                 g = None
                 if guards:
                     g = ' && '.join(x[0] for x in guards)
                     cond = f'(!({g}) || {cond})'
                 self.add_atom(atoms, ent, cond, refs, s, param, guard=g)
             elif k == 'Implication':
-                tx.refs = set(); tx.notes = []
+                tx.start()
                 try: p = tx.boolean(tx.scalar(n['predicate']))
                 except Unsupported as ex:
                     note(f"implication predicate not translated: {ex}; body omitted (approx: over)", 'unsupported')
                     return
-                walk(n['body'], guards + [(p.t, set(tx.refs))], soft)
+                walk(n['body'], guards + [(trunc_guard(p.t), set(tx.refs))], soft)
             elif k == 'Conditional':
-                tx.refs = set(); tx.notes = []
+                tx.start()
                 try: p = tx.boolean(tx.scalar(n['predicate']))
                 except Unsupported as ex:
                     note(f"if predicate not translated: {ex}; both branches omitted (approx: over)", 'unsupported')
                     return
                 r = set(tx.refs)
-                walk(n['ifBody'], guards + [(p.t, r)], soft)
+                tc = tx.trunc_cond()
+                walk(n['ifBody'], guards + [(trunc_guard(p.t), r)], soft)
                 if n.get('elseBody'):
-                    walk(n['elseBody'], guards + [(f'!{p.t}', r)], soft)
+                    walk(n['elseBody'], guards + [(f'(!({tc}) && !{p.t})' if tc else f'!{p.t}', r)], soft)
             elif k == 'Foreach':
-                tx.refs = set()
+                tx.start()
                 try:
                     a = tx.ex(n['arrayRef'])
                 except Unsupported as ex:
@@ -1301,7 +1468,7 @@ class Gen:
                     note(f'foreach over a dynamic array unrolled to its modelled maximum ({arr.max})', 'info')
                 self.unroll(tx, n, a, dims, 0, guards, soft, walk, note)
             elif k == 'Uniqueness':
-                tx.refs = set(); tx.notes = []
+                tx.start()
                 try:
                     elems = []
                     for x in n['items']:
@@ -1311,12 +1478,16 @@ class Gen:
                 except Unsupported as ex:
                     note(f'unique not translated: {ex}; omitted (approx: over)', 'unsupported'); return
                 refs = set(tx.refs)
+                tc = tx.trunc_cond()
+                if tc: note('unique over a dynamic array past its modelled elements: holds only while size() <= '
+                            'the model maximum (approx: over)')
                 for i in range(len(elems)):
                     for j in range(i + 1, len(elems)):
                         (a_, ga), (b_, gb) = elems[i], elems[j]
                         gs = [g for g in (ga, gb) if g] + [g[0] for g in guards]
                         cond = f'({a_.t} != {b_.t})'
                         if gs: cond = f"(!({' && '.join(gs)}) || {cond})"
+                        if tc: cond = f'({tc} || {cond})'
                         self.add_atom(atoms, ent, cond, refs, soft, param)
             elif k == 'SolveBefore':
                 note('solve...before only orders the solver (distribution); no effect on the legal set', 'info')
@@ -1333,8 +1504,7 @@ class Gen:
         walk(it, [], False)
         if it['k'] == 'Expression' and strip_conv(it.get('expr', {})).get('k') == 'Dist':
             note('dist: weights only shape the distribution; the legal set (non-zero weights) is assumed', 'info')
-        if any(a['soft'] for a in atoms[n0:]):
-            note('soft constraint assumed as hard (SOFT_EN); simulation drops it when it conflicts')
+        # soft items: kept or dropped (and the status) is decided by resolve_soft
         ent['status'] = status[0]
         if len(atoms) == n0 and status[0] == 'exact' and it['k'] not in ('SolveBefore',):
             if it['k'] not in ('SolveBefore', 'DisableSoft'): ent['status'] = 'exact'
@@ -1410,6 +1580,43 @@ class Gen:
         return any(v.name == nm for v in leaves(cm.root))
 
     # ---- call sites
+    def mode_calls(self, routine, receiver, before=None):
+        """constraint_mode()/rand_mode() setter calls of a routine on `receiver`, in source order"""
+        out = []
+        for c in (routine or {}).get('facts', {}).get('calls', []):
+            if c.get('name') not in ('constraint_mode', 'rand_mode') or c.get('value') is None: continue
+            if c.get('receiver') != receiver: continue
+            if before is not None and (c.get('line') or 0) >= before: continue
+            try: on = parse_const(c['value']).v != 0
+            except Exception: continue
+            out.append((c['name'], c.get('member'), on, f"{c['src']} ({routine.get('file')}:{c.get('line')})"))
+        return out
+
+    def routine_at(self, file, line):
+        for s in self.d['subroutines'] + self.d.get('procedures', []):
+            if s.get('file') == file and (s.get('start') or 0) <= line <= (s.get('end') or -1):
+                return s
+        return None
+
+    def modes(self, chain, site):
+        """(constraint_mode, rand_mode): {block/field name or None (all): (on, why)} in effect at
+        the call: the class's own new()/pre_randomize() (base first), then the calls made on the object
+        before the call in the calling routine (assumed to run before it: source order)"""
+        calls = []
+        for c in reversed(chain):
+            for s in self.d['subroutines']:
+                parts = (s.get('path') or '').split('::')
+                if len(parts) >= 2 and parts[-2] == c['name'] and parts[-1] in ('new', 'pre_randomize'):
+                    calls += self.mode_calls(s, 'this')
+        if site is not None:
+            calls += site.get('modes', [])
+        cm, rm = {}, {}
+        for kind, member, on, why in calls:
+            d = cm if kind == 'constraint_mode' else rm
+            if member is None: d.clear()        # obj.constraint_mode(v): every block
+            d[member] = (on, why)
+        return cm, rm
+
     def sites(self):
         """randomize() calls with inline constraints or an argument list; std::randomize"""
         out = []
@@ -1427,30 +1634,32 @@ class Gen:
                 continue
             tgt_cls = None
             names = []
+            encl = self.class_at(r['file'], r['line'])
             if r.get('target') == 'this' or not args or (args and args[0].get('k') != 'NamedValue' and
                                                           args[0].get('k') != 'MemberAccess'):
-                tgt_cls = self.classes.get(r.get('owner'))
+                tgt_cls = encl or self.cls(r.get('owner'))
                 names = [strip_conv(a).get('symbol', {}).get('sym') for a in args if a.get('k') != 'EmptyArgument']
             else:
-                tgt_cls = self.classes.get(sev_key(args[0].get('ty', '')))
+                tgt_cls = self.cls(args[0].get('ty', ''), encl['path'] if encl else None)
                 names = [strip_conv(a).get('symbol', {}).get('sym') for a in args[1:]]
                 # `obj.randomize(x)`: slang lists the target first
             if r.get('target') == 'this':
                 names = [strip_conv(a).get('left', a).get('symbol', {}).get('sym') if strip_conv(a).get('k') == 'Assignment'
                          else strip_conv(a).get('symbol', {}).get('sym') for a in args]
-            names = [x for x in names if x]
-            if inline is None and not names: continue
+            names = [x for x in names if x and x != 'this']     # this.randomize(): slang lists `this` first
+            modes = self.mode_calls(self.routine_at(r['file'], r['line']), r.get('target') or 'this', r['line'])
+            if inline is None and not names and not modes: continue
             if tgt_cls is None:
                 self.report.append({'kind': 'site', 'site': where, 'src': r['src'], 'status': 'unsupported',
                                     'notes': ['class of the randomized object not in the extraction']})
                 continue
             out.append({'kind': 'obj', 'cls': tgt_cls, 'inline': inline, 'args': names or None, 'where': where,
-                        'tag': tag, 'file': r['file'], 'src': r['src']})
+                        'tag': tag, 'file': r['file'], 'src': r['src'], 'modes': modes})
         return out
 
     def build_std(self, site):
         """std::randomize(v...) with {...}: the listed variables are random, everything else state"""
-        mname = ident(f"fv_c_std__{site['owner'] or 'scope'}__{site['tag']}")
+        mname = self.mod_names(f"fv_c_std__{site['owner'] or 'scope'}__{site['tag']}")
         mod = Module(mname, 'constraints', f"std::randomize at {site['where']}: {site['src']}")
         root = Obj(None, '', 'rand', site['where'])
         std_vars = {}
@@ -1474,7 +1683,7 @@ class Gen:
         atoms, entries = [], []
         inl = site['inline']
         if inl is not None:
-            items = inl['list'] if inl.get('k') == 'List' else [inl]
+            items = inl.get('list', []) if inl.get('k') == 'List' else [inl]
             for i, it in enumerate(items):
                 ent = {'kind': 'constraint', 'class': None, 'block': '<std::randomize>', 'item': i,
                        'file': site['file'], 'line': it.get('line'), 'src': it.get('src'), 'site': site['where']}
@@ -1624,7 +1833,7 @@ class CoverGen:
         self.gen, self.cg = gen, cg
         owner = cg.get('owner') or cg['path'].rsplit('.', 1)[0]
         self.owner = owner
-        self.mod = Module(ident(f"fv_cg_{owner.split('::')[-1].split('.')[-1]}__{cg['name']}"), 'covergroup',
+        self.mod = Module(gen.mod_names(f"fv_cg_{owner.split('::')[-1].split('.')[-1]}__{cg['name']}"), 'covergroup',
                           f"covergroup {cg['name']} ({cg['file']}:{cg['start']}) of {owner}")
         self.res = CgResolver(gen, self.mod, cg)
         self.tx = Tx(self.mod, self.res, gen)
@@ -1666,8 +1875,8 @@ class CoverGen:
                 self.entry_note(None, f'sampling event has an iff condition ({iff}); drive `sample` with it')
         cps = {}
         for cp in cg['coverpoints']:
-            if not cp.get('name'):      # unlabelled: named after its expression, as simulators report it
-                cp = {**cp, 'name': ident((cp.get('expr') or {}).get('src') or 'cp')}
+            # unlabelled: named after its expression, as simulators report it
+            cp = {**cp, 'name': ident((cp.get('name') or '').strip() or (cp.get('expr') or {}).get('src') or 'cp')}
             try:
                 cps[cp['name']] = self.coverpoint(cp)
             except Unsupported as e:
@@ -1736,7 +1945,7 @@ class CoverGen:
         w = ti.get('w') or cp.get('width')
         if not w: raise Unsupported(f"coverpoint {cp['name']}: type {cp.get('type')} not integral")
         sg = bool(ti.get('signed'))
-        tx.refs = set(); tx.notes = []
+        tx.start()
         x = tx.scalar(cp['expr'])
         x = tx.cast(x, w, sg)
         cpv = mod.names('cp_' + cp['name'])
@@ -2720,6 +2929,7 @@ def main():
     ap.add_argument('--expose', action='store_true', help='test hook: atoms / bin hits as output ports')
     ap.add_argument('-j', '--jobs', type=int, default=8)
     ap.add_argument('--timeout', type=int, default=600)
+    ap.add_argument('--sat-timeout', type=int, default=20, help='seconds per soft-constraint resolution query')
     ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')
     a = ap.parse_args()
     d = json.load(open(a.json))
@@ -2736,7 +2946,12 @@ def main():
                 tmo += 1; probs.append(f'{m.name}: {err} (covers reached so far: {len(rch)})'); continue
             if m.kind == 'constraints':
                 if 'sat' not in rch:
-                    unsat += 1; probs.append(f'{m.name}: constraints unsatisfiable for every input')
+                    unsat += 1
+                    core = gen.unsat_core(m)
+                    why = '' if not core else '; conflicting: ' + ' | '.join(
+                        f"{a['entry'].get('file')}:{a['entry'].get('line')} {a['entry'].get('src') or a['entry'].get('item')}"
+                        for a in core)
+                    probs.append(f'{m.name}: constraints unsatisfiable for every input{why}')
                 dead = sorted(x for x in unr if x.startswith('live_'))
                 for x in dead: probs.append(f'{m.name}: guard never true under the constraints: {x[5:]}')
             else:
