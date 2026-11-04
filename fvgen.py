@@ -1733,9 +1733,11 @@ class Gen:
                 continue
             if want and not want.search(site['cls']['name']): continue
             self.emit_constraint_module(site['cls'], site)
+        want_cg = re.compile(self.a.covergroups) if self.a.covergroups else None
         for cg in self.d['coverage']['covergroups']:
             if cg.get('uninstantiated'): continue
             if want and not want.search(cg.get('owner') or cg['path']): continue
+            if want_cg and not want_cg.search(cg['name']) and not want_cg.search(cg['path']): continue
             CoverGen(self, cg).build()
         if self.a.witness: self.plan_witness()
 
@@ -1782,7 +1784,86 @@ class Gen:
                         ports[port] = ('free', None, f"{'.'.join(sc[1])} is not rand and no constraint reads it")
                 if any(k == 'pin' for k, _, _ in ports.values()):
                     m.wit = {'cls': c, 'cm': cm, 'rm': rm, 'ports': ports}
+                    m.wit['cond'] = self.sample_condition(m, c, rm)
                 break
+
+    def sample_calls(self, cg):
+        """(call node, [(kind, ...)] path conditions) for every <cg>.sample(...) in the testbench:
+        kind 'if' (expr, taken) or 'case' (case expr, item exprs, default?)"""
+        out = []
+        def walk(n, path):
+            if isinstance(n, list):
+                for x in n: walk(x, path)
+                return
+            if not isinstance(n, dict): return
+            k = n.get('k')
+            if k == 'Call' and n.get('subroutineName') == 'sample':
+                sym = (n.get('thisClass') or {}).get('symbol') or {}
+                if sym.get('path') == cg['path'] or (sym.get('sym') == cg['name'] and
+                                                     sym.get('path', '').endswith('::' + cg['name'])):
+                    out.append((n, path))
+            if k == 'Conditional':
+                conds = [c.get('expr') for c in n.get('conditions') or [] if c.get('expr')]
+                for c in conds: walk(c, path)
+                walk(n.get('ifTrue'), path + [('if', x, True) for x in conds])
+                if len(conds) == 1: walk(n.get('ifFalse'), path + [('if', conds[0], False)])
+                else: walk(n.get('ifFalse'), path)
+                return
+            if k == 'Case':
+                items = n.get('items') or []
+                for it in items:
+                    walk(it.get('stmt'), path + [('case', n.get('expr'), it.get('expressions') or [], False)])
+                allx = [e for it in items for e in it.get('expressions') or []]
+                walk(n.get('defaultCase'), path + [('case', n.get('expr'), allx, True)])
+                return
+            for key, v in n.items():
+                if isinstance(v, (dict, list)): walk(v, path)
+        for r in self.d['subroutines'] + self.d.get('procedures', []):
+            if r.get('body'): walk(r['body'], [])
+        return out
+
+    def sample_condition(self, m, cls, rm):
+        """when the testbench samples the covergroup, in terms of the randomized object's fields:
+        the OR over its sample() calls of the if/case conditions leading there. Conditions on anything
+        else (other objects, null checks, globals) are assumed true."""
+        cg = next((g for g in self.d['coverage']['covergroups'] if m.origin.startswith(f"covergroup {g['name']} ({g['file']}:{g['start']})")), None)
+        res = {'text': "1'b1", 'leaves': {}, 'state': {}, 'notes': [], 'temps': []}
+        if cg is None: return res
+        calls = self.sample_calls(cg)
+        if not calls:
+            res['notes'].append('no sample() call found: every randomize() is assumed to be sampled')
+            return res
+        outs = {nm: rm.ports[nm][1] for nm in rm.port_order if rm.ports[nm][0] == 'output'}
+        ins = {nm for nm in rm.port_order if rm.ports[nm][0] == 'input'} - {'clk', 'reset', 'randomize'}
+        scratch = Module('fv_wit_cond', 'witness', '')
+        alts = []
+        for call, path in calls:
+            args = call.get('arguments') or []
+            roots = set()
+            for i, a in enumerate(args):        # the sampled object: its root symbol
+                a0 = strip_conv(a)
+                if a0.get('k') == 'NamedValue': roots.add(a0['symbol'].get('path'))
+            res_c = SampleCondResolver(self, cls, roots, outs, ins, res['leaves'], res['state'])
+            tx = Tx(scratch, res_c, self)
+            terms = []
+            for step in path:
+                try:
+                    if step[0] == 'if':
+                        t = tx.boolean(tx.scalar(step[1])).t
+                        terms.append(t if step[2] else f'!{t}')
+                    else:
+                        _, ce, items, dflt = step
+                        cv = tx.scalar(ce)
+                        eq = ' || '.join(f'({cv.t} == {tx.cast(tx.scalar(x), cv.w, cv.s).t})' for x in items) or "1'b0"
+                        terms.append(f'!({eq})' if dflt else f'({eq})')
+                except Unsupported as e:
+                    src = (step[1] or {}).get('src') if step[0] == 'if' else (step[1] or {}).get('src')
+                    res['notes'].append(f'sampling condition not on the sampled object, assumed true: {src or e}')
+            alts.append(' && '.join(terms) if terms else "1'b1")
+        res['text'] = '(' + ') || ('.join(alts) + ')' if alts else "1'b1"
+        res['temps'] = scratch.temps
+        res['notes'] = sorted(set(res['notes']))
+        return res
 
     def emit_constraint_module(self, cls, site=None):
         try:
@@ -2712,6 +2793,48 @@ def parse_event(ev):
     return (m.group(1) or 'posedge', m.group(2), m.group(3))
 
 
+class SampleCondResolver:
+    """names in the condition under which a covergroup is sampled: fields of the sampled object
+    (the call's argument, or the randomized object itself) become the fv_r_ outputs r_<field>"""
+
+    def __init__(self, gen, cls, roots, outs, ins, leaves, state):
+        self.gen, self.cls, self.roots, self.outs, self.ins = gen, cls, roots, outs, ins
+        self.leaves, self.state = leaves, state
+        self.chain = {c['path'] for c in gen.chain(cls)}
+
+    def leaf(self, path, n):
+        leaf = ident('__'.join(path))
+        if n.get('w') is None:
+            raise Unsupported(f"{'.'.join(path)} is not an integral field")
+        if leaf in self.outs:           # rand: the replay pins it
+            self.leaves[leaf] = ('.'.join(path), decl_width(self.outs[leaf]))
+            return S('r_' + leaf, n['w'], bool(n.get('signed')), None, not n.get('signed'))
+        # not rand: the object's state when it is randomized (the constraints may read it: q_, else free c_)
+        sig = ('q_' if leaf in self.ins else 'c_') + leaf
+        self.state[leaf] = ('.'.join(path), n['w'], sig)
+        return S(sig, n['w'], bool(n.get('signed')), None, not n.get('signed'))
+
+    def resolve(self, n, tx):
+        sym = n['symbol']
+        if sym.get('path') in self.roots and n.get('w') is None:
+            o = Obj(None, '', 'state', sym['sym'])
+            o.wit = (self.cls, [])
+            return ORef(o)
+        if sym.get('skind') == 'ClassProperty' and sym.get('path', '').rsplit('::', 1)[0] in self.chain:
+            return self.leaf([sym['sym']], n)
+        raise Unsupported(f"{sym.get('sym')} is not the sampled object")
+
+    def member(self, base, n, tx):
+        w = getattr(base.obj, 'wit', None)
+        if not w: raise Unsupported('member of another object')
+        path = w[1] + [n['member']['sym']]
+        if n.get('w') is None:
+            o = Obj(None, '', 'state', '.'.join(path))
+            o.wit = (w[0], path)
+            return ORef(o)
+        return self.leaf(path, n)
+
+
 class CgResolver:
     """names in coverpoint expressions become input ports: class fields, sample()/constructor
     arguments, module signals, hierarchical references"""
@@ -2906,10 +3029,11 @@ def witness(gen, out):
         rm, cm = w['rm'], w['cm']
         for lo, hi in chunks(m, gen.a.cover_chunk):
             top = ident('wit_' + m.name + (f'__{lo}' if len(m.hit_order) > gen.a.cover_chunk else ''))
+            cond = w['cond']
             lines = [f'module {top} (input logic clk);',
                      '  (* anyseq *) logic randomize;     // randomize() is called this cycle',
-                     "  logic sample = 1'b0;               // the covergroup samples the new values next cycle",
-                     '  always_ff @(posedge clk) sample <= randomize;']
+                     "  logic called = 1'b0;               // the new values are out the cycle after",
+                     '  always_ff @(posedge clk) called <= randomize;']
             rconns = ['.clk(clk)', ".reset(1'b0)", '.randomize(randomize)']
             for nm in rm.port_order:
                 if nm in ('clk', 'reset', 'randomize'): continue
@@ -2922,6 +3046,12 @@ def witness(gen, out):
                               f"  initial q_{nm} = '0;", f'  always_ff @(posedge clk) if (randomize) q_{nm} <= s_{nm};']
                     rconns.append(f'.{nm}(s_{nm})')
             lines.append(f'  {rm.name} u_r (' + ', '.join(rconns) + ');')
+            for leaf, (path, sw, sig) in sorted(cond['state'].items()):
+                if sig.startswith('c_'):    # object state no constraint reads: any value, held between calls
+                    lines += [f'  (* anyseq *) logic [{sw - 1}:0] cn_{leaf};', f'  logic [{sw - 1}:0] {sig};',
+                              f"  initial {sig} = '0;", f'  always_ff @(posedge clk) if (randomize) {sig} <= cn_{leaf};']
+            lines += cond['temps']
+            lines.append(f"  wire sample = called && {cond['text']};   // the testbench samples the object (if/case around sample())")
             conns = ['.clk(clk)', ".reset(1'b0)", '.sample(sample)']
             for port in m.port_order:
                 if port in ('clk', 'reset', 'sample'): continue
@@ -2997,6 +3127,10 @@ def parse_witness(job, jobdir, summary):
             for port, (kind, leaf, _) in w['ports'].items():
                 sig = {'pin': 'r_', 'state': 'q_'}.get(kind, 'f_') + (leaf if kind in ('pin', 'state') else port)
                 if sig in vals[st]: row[port] = vals[st][sig]
+            for leaf in w['cond']['leaves']:
+                if 'r_' + leaf in vals[st]: row['@' + leaf] = vals[st]['r_' + leaf]
+            for leaf, (_, _, sig) in w['cond']['state'].items():
+                if sig in vals[st]: row['$' + leaf] = vals[st][sig]
             samples.append(row)
         out[cover] = {'step': step, 'samples': samples}
     return out
@@ -3056,19 +3190,40 @@ def write_replay(gen, out):
             kinds = {p: w['ports'][p] for p in dp}
             pins = sorted(p for p, k in kinds.items() if k[0] == 'pin')
             others = sorted(p for p, k in kinds.items() if k[0] != 'pin')
-            steps = [[(w['ports'][p][1], w['ports'][p][2], s[p], decl_width(m.ports[p][1])) for p in pins if p in s]
+            pin_leaves = {w['ports'][p][1] for p in pins}
+            steps = [[(w['ports'][p][1], w['ports'][p][2], s[p], decl_width(m.ports[p][1])) for p in pins if p in s] +
+                     [(leaf, path, s['@' + leaf], wd) for leaf, (path, wd) in sorted(w['cond']['leaves'].items())
+                      if '@' + leaf in s and leaf not in pin_leaves]
                      for s in hit['samples']]
+            guards = [[(leaf, path, s['$' + leaf], wd) for leaf, (path, wd, _) in sorted(w['cond']['state'].items())
+                       if '$' + leaf in s] for s in hit['samples']]
+            enums = enum_names(w)
+            row['when'] = [{path: enums.get(leaf, {}).get(val, val) for leaf, path, val, _ in g} for g in guards]
+            row['steps'] = [{path: enums.get(leaf, {}).get(val, val) for leaf, path, val, _ in st} for st in steps]
             row.update({'status': 'replay' if not others else 'partial', 'randomize_calls': len(steps),
-                        'steps': [{path: val for _, path, val, _ in st} for st in steps],
+                        'sampled_when': w['cond']['text'], 'assumed': w['cond']['notes'],
                         'needs': {p: {'kind': kinds[p][0], 'why': kinds[p][2],
                                       'values': [s.get(p) for s in hit['samples']]} for p in others}})
             rows.append(row)
-            if pins: by_cls.setdefault(w['cls']['path'], (w['cls'], []))[1].append((key, steps))
+            if pins: by_cls.setdefault(w['cls']['path'], (w['cls'], []))[1].append((key, steps, guards, enums))
     text = replay_sv(gen, by_cls)
     with open(os.path.join(out, 'fv_replay.sv'), 'w') as f: f.write(text)
     with open(os.path.join(out, 'replay.json'), 'w') as f: json.dump(rows, f, indent=1)
     gen.replay_rows = rows
     return rows
+
+
+def enum_names(w):
+    """leaf -> {value: enum item name} for the randomized class's enum fields (readable replays)"""
+    out = {}
+    for v in leaves(w['cm'].root):
+        en = (v.ti or {}).get('enum') if isinstance(v, Var) else None
+        if en:
+            out[v.name] = {}
+            for e in en:
+                try: out[v.name][parse_const(e['value']).v] = e['name']
+                except Exception: pass
+    return out
 
 
 def replay_sv(gen, by_cls):
@@ -3099,7 +3254,7 @@ def replay_class(gen, c, covers):
         base += ' #(' + ', '.join(f".{p['name']}({p.get('value') or p.get('type_param')})" for p in params) + ')'
     lineage = [str(x) for x in c.get('lineage', [])]
     fields = {}
-    for key, steps in covers:
+    for key, steps, guards, enums in covers:
         for st in steps:
             for leaf, path, val, w in st: fields[leaf] = (path, w)
     L = [f"  // {c['name']} ({c['file']}:{c['start']}): {len(covers)} bins",
@@ -3117,7 +3272,8 @@ def replay_class(gen, c, covers):
                             for a in args)
         L.append(f"    function new({formals}); super.new({', '.join(a['name'] for a in args)}); endfunction")
     L += ['    static int fv_id = -2;      // bin selected by +FV_HIT (-1: none)',
-          '    static int fv_step = 0;     // randomize() calls made so far']
+          '    static int fv_step = 0;     // replay steps done (randomize() calls that matched the step\'s state)',
+          '    bit fv_match;               // this call is the next step: its pins apply']
     for leaf, (path, w) in sorted(fields.items()):
         L.append(f'    bit fv_en_{leaf};  logic [{w - 1}:0] fv_v_{leaf};  // {path}')
     L.append('    constraint fv_replay_c {')
@@ -3125,7 +3281,7 @@ def replay_class(gen, c, covers):
         L.append(f'      fv_en_{leaf} -> {path} == fv_v_{leaf};')
     L.append('    }')
     L += ['    static function int fv_id_of(string key);', '      case (key)']
-    for i, (key, _) in enumerate(covers):
+    for i, (key, _, _, _) in enumerate(covers):
         L.append(f'        "{key}": return {i};')
     L += ['        default: return -1;', '      endcase', '    endfunction']
     L += ['    function void fv_load();', '      string key;',
@@ -3134,17 +3290,23 @@ def replay_class(gen, c, covers):
           f'        if (fv_id == -1 && key != "") $display("fv_replay: +FV_HIT=%s is not a bin of {c["name"]}", key);',
           '      end']
     for leaf in sorted(fields): L.append(f'      fv_en_{leaf} = 0;')
-    L += ['      case (fv_id)']
-    for i, (key, steps) in enumerate(covers):
+    L += ['      fv_match = 0;', '      case (fv_id)']
+    for i, (key, steps, guards, enums) in enumerate(covers):
         L.append(f'        {i}: case (fv_step)  // {key}')
+        def val_text(leaf, val, w):
+            nm = enums.get(leaf, {}).get(val)
+            return f"{w}'h{val:x}" + (f' /* {nm} */' if nm else '')
         for k, st in enumerate(steps):
-            sets = ' '.join(f"fv_en_{leaf} = 1; fv_v_{leaf} = {w}'h{val:x};" for leaf, _, val, w in st)
-            L.append(f'          {k}: begin {sets} end')
+            sets = ' '.join(f"fv_en_{leaf} = 1; fv_v_{leaf} = {val_text(leaf, val, w)};" for leaf, _, val, w in st)
+            g = ' && '.join(f"{path} == {val_text(leaf, val, w)}" for leaf, path, val, w in guards[k]) if guards[k] else ''
+            # a step whose witness had the object in some state applies only to a call in that state
+            L.append(f'          {k}: if ({g}) begin fv_match = 1; {sets} end' if g else
+                     f'          {k}: begin fv_match = 1; {sets} end')
         L.append('          default: ;')
         L.append('        endcase')
     L += ['        default: ;', '      endcase', '    endfunction']
     L += ['    function void pre_randomize(); super.pre_randomize(); fv_load(); endfunction',
-          '    function void post_randomize(); super.post_randomize(); if (fv_id >= 0) fv_step++; endfunction',
+          '    function void post_randomize(); super.post_randomize(); if (fv_match) fv_step++; endfunction',
           '  endclass', '']
     return '\n'.join(L)
 
@@ -3259,8 +3421,12 @@ def report_md(rep):
                 st = ' ; '.join('{' + ', '.join(f'{k}={v}' for k, v in x.items()) + '}' for x in r['steps'])
                 out.append(f"- **{r['status']}** `+FV_HIT={r['key']}` ({r['class']}, {r['randomize_calls']} randomize() "
                            f"calls): {st}")
+                if any(r.get('when') or []):
+                    out.append(f"  - each step applies to the next call where the object is in the witness state: {r['when']}")
                 for p, n in r.get('needs', {}).items():
                     out.append(f"  - also needs `{p}` = {n['values']} ({n['why']})")
+                for a in r.get('assumed', []):
+                    out.append(f'  - {a}')
             else:
                 out.append(f"- **{r['status']}** `{r['key']}` ({r['class']})")
         out.append('')
@@ -3304,6 +3470,7 @@ def main():
     ap.add_argument('json', help='sniper output')
     ap.add_argument('-o', '--out', default='fv_out')
     ap.add_argument('--classes', help='regex: only classes/covergroup owners matching it')
+    ap.add_argument('--covergroups', help='regex: only covergroups whose name or path matches it')
     ap.add_argument('--inherited', action='store_true', help='also emit classes that only inherit constraints')
     ap.add_argument('--max-array', type=int, default=8, help='elements modelled for a dynamic array/queue')
     ap.add_argument('--max-bins', type=int, default=256, help='values expanded for one array bin')

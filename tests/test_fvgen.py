@@ -592,41 +592,60 @@ def test_witness_replay(seeds=(1, 7, 1234), n_free=2000):
     out = os.path.join(work, 'fv')
     run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', out, '--witness', '--expose'])
     rep = json.load(open(os.path.join(out, 'report.json')))
-    rows = {r['cover']: r for r in rep['replay']}
+    rows = {r['cover']: r for r in rep['replay'] if r['covergroup'] == 'fv_cg_pkt__cg'}
     order = rep['hit_order']['fv_cg_pkt__cg']
     assert set(rows) == set(order)
     # what the formal run must conclude: CFG implies ch < 4, mode is not rand
     assert rows['cov_x_kc__auto_CFG__hi']['status'] == 'unreached'
     assert rows['cov_cp_mode__m3']['status'] == 'partial' and rows['cov_cp_mode__m3']['needs']['mode']['kind'] == 'free'
     assert {r['status'] for c, r in rows.items() if c not in ('cov_x_kc__auto_CFG__hi', 'cov_cp_mode__m3')} == {'replay'}
-    assert [st['kind'] for st in rows['cov_cp_kind__seq_rw']['steps']][-3:] == [1, 2, 1]      # RD => WR => RD
+    assert [st['kind'] for st in rows['cov_cp_kind__seq_rw']['steps']][-3:] == ['RD', 'WR', 'RD']
 
-    # the covergroup module, driven from the object after each randomize(), sampled once per call
-    hdr = re.search(r'^module fv_cg_pkt__cg\b.*?\);', open(os.path.join(out, 'fv_covers.sv')).read(), re.S | re.M).group(0)
-    ports = re.findall(r'input logic (?:signed )?(\[\d+:0\]) (\w+)', hdr)
-    fields = [p for _, p in ports if p not in ('clk', 'reset', 'sample')]
-    nh = len(order)
-    decls = ' '.join(f'logic {w} {p};' for w, p in ports if p not in ('clk', 'reset', 'sample'))
+    # rd_cg is sampled only for RD packets (pinned with the bin), md_cg only when mode == 2 (testbench
+    # state: the replay waits for a call in that state)
+    rows_all = {r['key']: r for r in rep['replay']}
+    assert all(st['kind'] == 'RD' for r in rows_all.values() if '__rd_cg.' in r['key'] and r['status'] == 'replay'
+               for st in r['steps'])
+    assert all(w == {'mode': 2} for r in rows_all.values() if '__md_cg.' in r['key'] and r['status'] == 'replay'
+               for w in r['when'])
+    assert rows_all['fv_cg_coll__md_cg.cov_cp_kind__rd_cfg']['status'] == 'replay'
+
+    # every covergroup module, driven from the object after each randomize(): pkt's own covergroup on
+    # every call, the collector's as coll.write() does. mode cycles 0..3 and is set before randomize()
+    covers_sv = open(os.path.join(out, 'fv_covers.sv')).read()
+    mods = {'fv_cg_pkt__cg': '1', 'fv_cg_coll__rd_cg': "p.kind == wt_pkg::RD", 'fv_cg_coll__md_cg': 'p.mode == 2'}
+    inst, decls, drive = [], [], []
+    for mod, when in mods.items():
+        hdr = re.search(r'^module %s\b.*?\);' % mod, covers_sv, re.S | re.M).group(0)
+        ports = [(w, p) for w, p in re.findall(r'input logic (?:signed )?(\[\d+:0\]) (\w+)', hdr)
+                 if p not in ('clk', 'reset', 'sample')]
+        n = len(rep['hit_order'][mod])
+        decls.append(f"logic s_{mod}; logic [{n - 1}:0] h_{mod}, a_{mod} = '0; " +
+                     ' '.join(f'logic {w} {mod}_{p};' for w, p in ports))
+        inst.append(f"{mod} u_{mod} (.clk, .reset(1'b0), .sample(s_{mod}), " +
+                    ', '.join(f'.{p}({mod}_{p})' for _, p in ports) + f', .fv_hits(h_{mod}));')
+        drive.append(f's_{mod} = {when}; ' + ' '.join(f'{mod}_{p} = p.{p.split("__")[-1]};' for _, p in ports))
+    nl = '\n'
     tb = f'''
 module tb;
-  logic clk = 0, sample = 0; {decls}
-  logic [{nh - 1}:0] hits, acc = '0;
-  fv_cg_pkt__cg u (.clk, .reset(1'b0), .sample, {', '.join(f'.{p}' for p in fields)}, .fv_hits(hits));
+  logic clk = 0;
+  {nl.join('  ' + x for x in decls)}
+  {nl.join('  ' + x for x in inst)}
   initial begin
-    int calls, fails = 0, m = 0;
+    int calls, fails = 0, m = -1;
     wt_pkg::pkt p;
     fv_replay_pkg::pkt__fv_replay r = new();
     p = r;                                   // the testbench only sees a pkt (factory override)
     if (!$value$plusargs("CALLS=%d", calls)) calls = 1;
     void'($value$plusargs("MODE=%d", m));
-    repeat (calls) begin
+    for (int i = 0; i < calls; i++) begin
+      p.mode = m >= 0 ? m : i % 4;          // testbench state, set before randomize()
       if (!p.randomize()) fails++;
-      p.mode = m;
-      {' '.join(f'{f} = p.{f};' for f in fields)}
-      sample = 1; #1; acc |= hits;
-      clk = 1; #1; clk = 0; sample = 0; #1;
+      {' '.join(drive)}
+      #1; {' '.join(f'a_{mod} |= s_{mod} ? h_{mod} : 0;' for mod in mods)}
+      clk = 1; #1; clk = 0; #1;
     end
-    $display("H %b F %0d", acc, fails);
+    $display("H {' '.join(f'%b' for _ in mods)} F %0d", {', '.join(f'a_{mod}' for mod in mods)}, fails);
     $finish;
   end
 endmodule
@@ -638,25 +657,29 @@ endmodule
 
     def sim(*args):
         r = run([os.path.join(out, 'obj_dir', 'vtb'), *args], cwd=out)
-        m = re.search(r'H ([01]+) F (\d+)', r.stdout)
+        m = re.search(r'H ([01 ]+) F (\d+)', r.stdout)
         assert m, r.stdout
-        bits = m.group(1)[::-1]
-        return {order[i] for i, b in enumerate(bits) if b == '1'}, int(m.group(2))
+        got = set()
+        for mod, bits in zip(mods, m.group(1).split()):
+            got |= {f'{mod}.{rep["hit_order"][mod][i]}' for i, b in enumerate(bits[::-1]) if b == '1'}
+        return got, int(m.group(2))
 
     checked = 0
-    for cover, r in rows.items():
+    for key, r in rows_all.items():
         if r['status'] not in ('replay', 'partial'): continue
         extra = [f"+MODE={r['needs']['mode']['values'][-1]}"] if 'mode' in r.get('needs', {}) else []
+        # guarded steps wait for a call in the witness state: allow a full mode cycle per step
+        calls = r['randomize_calls'] * (4 if any(r.get('when') or []) else 1)
         for seed in seeds:
-            got, fails = sim(f"+FV_HIT={r['key']}", f"+CALLS={r['randomize_calls']}", f'+verilator+seed+{seed}', *extra)
-            assert fails == 0, f'{cover} seed {seed}: the pinned values violate the class constraints'
-            assert cover in got, f'{cover} not hit with seed {seed} (steps {r["steps"]})'
+            got, fails = sim(f'+FV_HIT={key}', f'+CALLS={calls}', f'+verilator+seed+{seed}', *extra)
+            assert fails == 0, f'{key} seed {seed}: the pinned values violate the class constraints'
+            assert key in got, f'{key} not hit with seed {seed} (steps {r["steps"]}, when {r.get("when")})'
             checked += 1
     # without +FV_HIT the override changes nothing; a bin formal found unreachable is never hit
     got, fails = sim(f'+CALLS={n_free}', '+verilator+seed+5')
-    assert fails == 0 and 'cov_x_kc__auto_CFG__hi' not in got
+    assert fails == 0 and 'fv_cg_pkt__cg.cov_x_kc__auto_CFG__hi' not in got
     shutil.rmtree(work, ignore_errors=True)
-    return checked, len(rows)
+    return checked, len(rows_all)
 
 
 if __name__ == '__main__':

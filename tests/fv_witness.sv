@@ -35,6 +35,28 @@ package wt_pkg;
     function new(); endfunction
 `endif
   endclass
+
+  // a coverage collector: covergroups sampled with the object, under conditions on a rand field
+  // (kind) and on testbench state (mode, set before randomize())
+`ifndef VERILATOR
+  class coll;
+    covergroup rd_cg with function sample(pkt p);
+      cp_len : coverpoint p.len { bins b[4] = {[1:200]}; }
+      cp_ch : coverpoint p.ch { bins lo = {[0:7]}; bins hi = {[8:15]}; }
+    endgroup
+    covergroup md_cg with function sample(pkt p);
+      cp_kind : coverpoint p.kind { bins wr = {WR}; bins rd_cfg = (RD => CFG); }
+    endgroup
+    function new(); rd_cg = new(); md_cg = new(); endfunction
+    function void write(pkt p);
+      case (p.kind)
+        RD: rd_cg.sample(p);
+        default: ;
+      endcase
+      if (p.mode == 2) md_cg.sample(p);
+    endfunction
+  endclass
+`endif
 endpackage
 
 module wt_top;
