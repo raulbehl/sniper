@@ -126,6 +126,7 @@ package ra_pkg;   // fvgen regressions from real testbenches; fv_regress_b.sv re
   class vr_c;
     localparam int W = 32;
     rand bit [1:0] rs;
+    rand bit [3:0] dg;
     rand bit signed [2:0] p1;
     covergroup cg;
       cp_rs : coverpoint rs {
@@ -138,6 +139,14 @@ package ra_pkg;   // fvgen regressions from real testbenches; fv_regress_b.sv re
       cp_k : coverpoint rs { bins v[] = {[0:3]}; ignore_bins i3 = {3} iff (W == 32); ignore_bins i0 = {0} iff (W == 64); }
       // array bins with a filter: one bin per value that passes (cva6 RAL: {[0:$]} with (!(item inside {0})))
       cp_f : coverpoint rs { bins legal[] = {0}; bins illegal[] = {[0:$]} with (!(item inside {0})); }
+      // bins = <coverpoint> with (...): from all values of the type (OpenTitan hmac sha2_invalid)
+      cp_dg : coverpoint dg { bins one = {1}; bins multi = cp_dg with (!$onehot0(item)); }
+      // default bins: illegal -> assertion; empty when the other bins cover every value
+      cp_d : coverpoint rs { bins v[] = {0, 1}; illegal_bins others = default; }
+      cp_e : coverpoint rs { bins v[] = {[0:3]}; illegal_bins none = default; }
+      // a coverpoint switched off by the configuration (riscv-dv iff (XLEN == 64 && ...)) and its cross
+      cp_off : coverpoint rs iff (W == 64 && rs != 0) { bins z = {1}; }
+      x_off : cross cp_off, cp_k;
     endgroup
     function new(); cg = new(); endfunction
   endclass

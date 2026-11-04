@@ -548,6 +548,13 @@ def test_regressions():
                                                                                'cov_cp_k__v__2']
     assert [h for h in rep['hit_order']['fv_cg_vr_c__cg'] if 'cp_f' in h] == [
         'cov_cp_f__legal__0', 'cov_cp_f__illegal__1', 'cov_cp_f__illegal__2', 'cov_cp_f__illegal__3']
+    vh = rep['hit_order']['fv_cg_vr_c__cg']
+    assert 'cov_cp_dg__multi' in vh and "!$onehot0(cp_cp_dg)" in vr and "1'b0 && (!$onehot0" not in vr
+    assert 'ill_cp_d__others' in vr and not any('cp_d__others' in h for h in vh)       # an assertion
+    assert not any('cp_e__none' in h for h in vh) and 'ill_cp_e__none' not in vr          # empty default
+    assert not any('cp_off' in h or 'x_off' in h for h in vh)
+    off = [e for e in rep['entries'] if e.get('disabled') and e.get('owner', '').endswith('vr_c')]
+    assert sorted(e.get('coverpoint') or e.get('cross') for e in off) == ['cp_off', 'x_off']
     vr_notes = [n for e in rep['entries'] if e.get('covergroup') == 'cg' and e.get('owner', '').endswith('vr_c')
                 for n in e.get('notes', [])]
     assert any('value 7 is outside the coverpoint type (2-bit unsigned)' in n for n in vr_notes)

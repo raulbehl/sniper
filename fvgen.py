@@ -473,6 +473,12 @@ class Tx:
             raise Unsupported('=== against x/z')
         f = fold_bin(op, l, r, w, s)
         if f is not None: return f
+        if op in ('LogicalAnd', 'LogicalOr'):       # one constant operand decides or drops out
+            for a, b in ((l, r), (r, l)):
+                if a.k is not None and not a.k.x:
+                    if bool(a.k.v) == (op == 'LogicalOr'):
+                        return S("1'b1" if op == 'LogicalOr' else "1'b0", 1, False, K(int(op == 'LogicalOr'), 1))
+                    return self.boolean(b)
         return S(f'({l.t} {BINOP[op]} {r.t})', w, s)
 
     def power(self, l, r, w, s):
@@ -2003,6 +2009,10 @@ def size_bound(e, prop):
 
 
 # ======================================================================== coverage
+class Disabled(Exception):
+    """a coverpoint/cross switched off by the configuration (constant-false iff)"""
+
+
 class Bin:
     def __init__(self, name, cond, kind, values=None, entry=None):
         self.name, self.cond, self.kind, self.values, self.entry = name, cond, kind, values, entry
@@ -2062,11 +2072,22 @@ class CoverGen:
             cp = {**cp, 'name': ident((cp.get('name') or '').strip() or (cp.get('expr') or {}).get('src') or 'cp')}
             try:
                 cps[cp['name']] = self.coverpoint(cp)
+            except Disabled as e:
+                cps[cp['name']] = None
+                self.entries.append({'kind': 'coverpoint', 'covergroup': cg['name'], 'owner': self.owner,
+                                     'coverpoint': cp['name'], 'file': cp['file'], 'line': cp['start'],
+                                     'status': 'exact', 'disabled': True, 'notes': [str(e)]})
             except Unsupported as e:
                 self.entries.append({'kind': 'coverpoint', 'covergroup': cg['name'], 'owner': self.owner,
                                      'coverpoint': cp['name'], 'file': cp['file'], 'line': cp['start'],
                                      'status': 'unsupported', 'notes': [str(e)]})
         for cx in cg['crosses']:
+            off = [t for t in cx['targets'] if t in cps and cps[t] is None]
+            if off:
+                self.entries.append({'kind': 'cross', 'covergroup': cg['name'], 'owner': self.owner,
+                                     'cross': cx['name'], 'file': cx['file'], 'line': cx['start'], 'status': 'exact',
+                                     'disabled': True, 'notes': [f"crosses disabled coverpoint(s) {', '.join(off)}"]})
+                continue
             try: self.cross(cx, cps)
             except Unsupported as e:
                 self.entries.append({'kind': 'cross', 'covergroup': cg['name'], 'owner': self.owner,
@@ -2137,6 +2158,9 @@ class CoverGen:
         iff = "1'b1"
         if cp.get('iff'):
             iff_s = tx.boolean(tx.scalar(cp['iff']))
+            if iff_s.k is not None and not iff_s.k.v:
+                raise Disabled(f"iff ({(cp['iff'] or {}).get('src') or '...'}) is constant false in this "
+                               'configuration: the coverpoint never samples')
             iffn = mod.names('iff_' + cp['name'])
             mod.body.append(f'  wire {iffn} = {iff_s.t};')
             iff = iffn
@@ -2223,8 +2247,21 @@ class CoverGen:
             else:
                 others = [x.cond for x in cpinfo['bins']] + excl
                 cond = '!(' + ' || '.join(others) + ')' if others else "1'b1"
-                self.cover(f"{cp['name']}__{b['name']}", f'{iff} && {cond}', ent, at_least)
-                ent['notes'] = ['default bin: values in no other bin; informational (not part of coverage, LRM 19.5)']
+                lo_t, hi_t = self.tmin_max(cpinfo)
+                known = all(x.values is not None for x in cpinfo['bins']) and w <= 16
+                left = known and any(v not in excl_vals and not any(lo <= v <= hi for x in cpinfo['bins']
+                                                                     for lo, hi in x.values)
+                                     for v in range(lo_t, hi_t + 1))
+                if known and not left:
+                    ent['notes'] = ['default bin: every value is in another bin; empty']
+                elif b['kind'] == 'IllegalBins':
+                    self.illegal(f"{cp['name']}__{b['name']}", f'{iff} && {cond}', ent)
+                    ent['notes'] = ['illegal default bin: an assertion (a value in no other bin is an error)']
+                elif b['kind'] == 'IgnoreBins':
+                    ent['notes'] = ['ignore default bin: values in no other bin are ignored; no cover']
+                else:
+                    self.cover(f"{cp['name']}__{b['name']}", f'{iff} && {cond}', ent, at_least)
+                    ent['notes'] = ['default bin: values in no other bin; informational (not part of coverage, LRM 19.5)']
             self.entries.append(ent)
         return cpinfo
 
@@ -2240,6 +2277,9 @@ class CoverGen:
         def note(msg):
             if msg not in notes: notes.append(msg)
         tname = f"{w}-bit {'signed' if s else 'unsigned'}"
+        if not b.get('values') and b.get('withExpr') is not None:
+            # bins b = <coverpoint> with (expr): every value of the coverpoint's type (LRM 19.5.1.1)
+            return [('r', None, None)]
         for v in b.get('values') or []:
             vk = strip_conv(v)
             if vk.get('k') == 'ValueRange':
