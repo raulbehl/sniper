@@ -33,7 +33,11 @@ python tests/test_probe.py          # or: pytest tests/
 ```
 
 Runs sniper on `tests/probe_tb.sv` and checks the extracted classes, constraints, covergroup
-bins/crosses, assertions, randomization sites, stimulus map, config overrides and hierarchy.
+bins/crosses, assertions, randomization sites, stimulus map, config overrides and hierarchy;
+`probe_corpus.sv` holds constructs that broke on real testbenches, `probe_fv.sv` what fvgen reads
+(widths/signedness, struct offsets, `type_info`, transition steps, option values, functions called
+from constraints, `constraint_mode`/`rand_mode` calls), `probe_invalid.sv` code slang cannot bind.
+Every extraction bug found on the corpus gets an assertion there.
 
 ## Output
 
@@ -92,7 +96,7 @@ python fvgen.py axi_uvm_tb_constructs.json -o fv/ --run      # --run: smoke-chec
 | `fv_constraints.sv` | `fv_c_<class>`: constraint checker. Rand fields and the state the constraints read are inputs; each constraint item is a wire plus an `ASSUME(.., IMPLIES(en, ..))`. Parameters `CM_<block>` (constraint_mode), `SOFT_EN`, `INLINE_EN`. `fv_r_<class>`: `randomize()` model, anyseq values latched when `randomize` is high and constrained in that cycle; outputs hold between calls. One `fv_c_/fv_r_<class>__<site>` per `randomize()` call with inline constraints or an argument list, and per `std::randomize` |
 | `fv_covers.sv` | `fv_cg_<owner>__<cg>`: one `cover` per bin (label = bin name) under `sample && iff`; illegal bins are `ASSERT`s (``ifndef FV_NO_ILLEGAL_BINS``); transition bins are monitors over the sampled values |
 | `fv_bind.sv` | instantiation templates for covergroups declared in modules/interfaces |
-| `smoke/` | one top + `.sby` per module, all inputs free: constraints satisfiable, every implication/if guard reachable (dead constraint code otherwise), every bin reachable |
+| `smoke/` | one top + `.sby` per module, all inputs free: constraints satisfiable (an unsatisfiable set is reported with a minimal conflicting core: file:line and source of each item), every implication/if guard reachable (dead constraint code otherwise), every bin reachable. `--run` runs them; job directories are removed and no traces written unless `--keep`; a job over `--timeout` is killed with its solver processes and reported as a timeout |
 | `report.md/.json` | every constraint item and bin: what it became, **exact / approx / unsupported**, why, and the direction of any approximation |
 
 Constraint semantics (IEEE 1800-2017 clause 18): inheritance with same-name block override; rand
@@ -101,9 +105,21 @@ arrays/queues up to a maximum inferred from `size()` constraints, else `--max-ar
 `i < size` guards); `inside` with ranges, `$` and array operands; `dist` as membership in the
 non-zero-weight items; `unique`; `sum/product/and/or/xor() with`; single-return user functions
 (including methods of other objects and functions outside `--own`) inlined; rand enums limited to
-their named values; `solve before` ignored (ordering only); `soft` assumed under `SOFT_EN` and
-dropped at call sites whose inline constraints constrain the same field; `randomize(a, b)` frees
-only `a`, `b`. Expressions keep SV widths: every slang `Conversion` becomes a size cast plus
+their named values; `solve before` ignored (ordering only); `randomize(a, b)` frees only `a`, `b`.
+`soft` follows LRM 18.5.13: in priority order (inline over class, derived over base, later over
+earlier) a soft constraint is kept only if it is satisfiable with the hard constraints and the
+softs already kept. When the constraints involved read only rand variables this is decided at
+generation time with yosys `sat` (exact; `--sat-timeout`); when they read testbench state it
+depends on the state, and the soft constraint is kept as hard (approx) unless no state allows it
+or the call site's inline constraints constrain the same field. Kept softs are under `SOFT_EN`.
+A dynamic array whose `size()` can exceed `--max-array` is modelled up to that many elements:
+`size()` itself is not capped, later elements are free, and constraints that read the whole array
+(reductions, `inside` the array, `unique`, variable indices) hold only while `size()` is within the
+model (approx: over, never a false unsat). `constraint_mode(v)` / `rand_mode(v)` calls on the
+object before a `randomize()` in the same routine, and on `this` in the class's `new()` /
+`pre_randomize()`, set the site's `CM_<block>` defaults / turn the field into state (source order
+is assumed to be execution order). Classes are resolved by package when names repeat; module names
+are made unique. Expressions keep SV widths: every slang `Conversion` becomes a size cast plus
 `$signed/$unsigned`; `**` is lowered (the SMT backends have no `$pow`).
 
 Coverage semantics (clause 19): value bins, `[]` (one per value) and `[N]` (values split in order,
@@ -118,7 +134,10 @@ shifts, `**`, ascending ranges, packed structs, enums, casts, `inside`) equal to
 elaboration of the same SV; **T2** checks whole constraint sets against Verilator's solver in both
 directions (its solutions satisfy the assumes; tuples the assumes accept, including boundary
 mutations of solutions, are accepted by `randomize() with` pins); **T3** compares every bin and
-transition monitor with an LRM reference model on random sample traces.
+transition monitor with an LRM reference model on random sample traces; **R** runs
+`tests/fv_regress_*.sv` (constructs that broke on the corpus: name collisions across packages and
+files, empty inline blocks, truncated arrays, soft priority, mode calls, `this.randomize()`, unsat
+cores, ...) through sniper, fvgen and the smoke runs, and checks a hung `sby` is killed on timeout.
 
 ## Notes
 
