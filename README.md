@@ -170,9 +170,33 @@ holds that value. Inputs are traced from the extraction alone:
 
 DUT-internal signals are probed after flattening. The report lists, per covergroup input, the RTL
 signal it maps to and why; per bin **reached** (with the cycle), **unreached** (not within
-`--rtl-depth`: no proof), or **unmapped** (an input with no RTL counterpart: testbench state). Not
-yet: input constraints from the drivers, and the testbench's concurrent SVA (yosys-slang reads
-immediate assertions only), so a reached bin may use input sequences the bus protocol forbids.
+`--rtl-depth`: no proof), or **unmapped** (an input with no RTL counterpart: testbench state).
+
+Concurrent SVA in the RTL and in the testbench's bind files (`--rtl-bind`: bind modules and the
+checkers they bind, e.g. OpenTitan's `tlul_assert`) is lowered by `svalower.py` (below), so the
+design's and the checkers' **assumptions constrain the runs** (a device-side protocol checker
+assumes legal bus traffic) and `--rtl-asserts` checks their **assertions** under those assumptions
+for `--rtl-assert-depth` cycles, listing each failing assertion with its cycle. A design that uses
+both clock edges runs in multiclock mode (inputs change at the rising edge, as a clocked driver
+drives them). Not yet: the testbench drivers' behaviour as input constraints.
+
+### `svalower.py`: concurrent SVA for yosys-slang
+
+```sh
+python svalower.py -o out/ -f rtl.f -f bind.f      # out/lowered.f + rewritten copies + sva_report.json
+```
+
+yosys-slang reads immediate assertions only. Every `assert/assume/cover property` (written directly or
+produced by a macro: the macro call is replaced) becomes, in a copy of its file, an immediate assertion
+on the property's clock plus flops: `|->` / `|=>` between fixed-delay sequences (`a ##1 b |=> ##2 c`),
+`$past(e, n)`, `$rose`, `$fell`, `$stable`, `$changed`, `$isunknown` (0 in two-valued formal),
+`disable iff` (an attempt spanning a disabled cycle is cancelled), named sequences and properties
+without arguments, `default clocking` / `default disable iff`, `and`/`or` of single-cycle sequences.
+A failing attempt is reported at its first unmatched step, as SVA reports it. Not lowered, and listed
+with the reason: liveness (`s_eventually`), ranged or unbounded delays, repetition, multi-cycle
+`and`/`or`, `throughout`/`until`, local variables, arguments. **T6** checks the lowering against
+Verilator's native SVA: on random traces with resets, every lowered property fails at exactly the
+cycles the original does.
 
 Coverage semantics (clause 19): value bins, `[]` (one per value) and `[N]` (values split in order,
 remainder in the last), wildcard, `with` filters, `iff`, ignore/illegal values removed from every
