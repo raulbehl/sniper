@@ -13,8 +13,8 @@ bind_tops = ["uart_bind"]          # the bind modules among them
 
 defines   = []                     # extra defines for reading the RTL, e.g. ["FPGA=1"]
 
-clock     = ["clk_i"]              # DUT clock input(s)
-reset     = "rst_ni"               # DUT reset input
+clock     = ["clk_i"]              # DUT clock input(s): all run off the formal clock
+reset     = ["rst_ni"]             # DUT reset input(s): all held together for the first cycles
 reset_active_low = true
 
 depth     = 40                     # cycles explored from reset (optional, default 40)

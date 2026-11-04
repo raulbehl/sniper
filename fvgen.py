@@ -1861,8 +1861,12 @@ class Gen:
                 tc = n.get('thisClass') or {}
                 sym = tc.get('symbol') or tc.get('member') or {}     # cg.sample() / obj.cg.sample()
                 p = sym.get('path', '')
+                ty = re.sub(r'^.*::', '', tc.get('ty', '') or '')
                 if p in (cg['path'], f"{cg['path']}::{cg['name']}") or (sym.get('sym') == cg['name'] and
-                                                                         p.endswith('::' + cg['name'])):
+                                                                         p.endswith('::' + cg['name'])) \
+                        or (ty == cg['name'] and cg['path'].endswith('::' + cg['name'])):
+                    # the last case: an instance (a class member) of a covergroup type declared outside
+                    n = dict(n, fv_instance=sym.get('sym'))
                     out.append((n, path))
             if k == 'Conditional':
                 conds = [c.get('expr') for c in n.get('conditions') or [] if c.get('expr')]
@@ -3548,7 +3552,7 @@ class RtlMap:
 
     def slang_args(self):
         if getattr(self, 'lowered', None):      # concurrent SVA lowered (svalower): read the copies
-            args = ['-U', 'SYNTHESIS', '--ignore-timing', '-f', self.lowered]
+            args = ['-f', self.lowered]     # the RTL's synthesis view; the bound checkers' copies lift it
         else:
             args = []
             for f in (self.a.rtl or []) + (self.a.rtl_bind or []): args += ['-f', os.path.abspath(f)]
@@ -3613,13 +3617,26 @@ class RtlMap:
         return ('net', base, lo, width if width is not None else w)
 
     def ral(self, call):
-        """reg.field.get_mirrored_value() / get(): the field's bits in the register model's HDL path"""
+        """reg.field.get_mirrored_value() / get(): the field's bits in the register model's HDL path;
+        reg.get_mirrored_value(): the whole register, its slices at their offsets"""
         tc = strip_conv(call.get('thisClass') or {})
         if tc.get('k') != 'MemberAccess': return None, 'register field not recognised'
+        ral = self.d.get('ral') or {}
+        whole = tc['member']['sym']
+        for blk, b in ral.get('blocks', {}).items():
+            r = b['regs'].get(whole)
+            if r and r['class'] in ral.get('regs', {}) and tc['member'].get('path', '').startswith(blk):
+                parts = []
+                for sl in r['slices']:
+                    src = self.net(sl['path'], 0, sl['size']) if sl['size'] else None
+                    if src is None: return None, f"{whole}: HDL path {sl['path']} not found in the DUT"
+                    parts.append((sl['offset'], src))
+                if not parts: return None, f'{whole}: no HDL path'
+                desc = ', '.join(f"{p[1]}@{o}" for o, p in parts)
+                return ('reg', parts), f'register {whole} -> {desc}'
         field = tc['member']['sym']
         regn = strip_conv(tc.get('value') or {})
         reg = (regn.get('member') or {}).get('sym') if regn.get('k') == 'MemberAccess' else (regn.get('symbol') or {}).get('sym')
-        ral = self.d.get('ral') or {}
         for blk, b in ral.get('blocks', {}).items():
             r = b['regs'].get(reg)
             if not r: continue
@@ -3669,11 +3686,19 @@ class RtlMap:
         return None, f"{'.'.join(path)}: not copied from an interface signal"
 
     def map_cg(self, m):
-        """port -> (source or None, why) for one covergroup module"""
+        """{instance: {port: (source or None, why)}} for one covergroup module: a covergroup type with
+        several instances (members sampled with different arguments) has one mapping per instance"""
         cg = next((g for g in self.d['coverage']['covergroups'] if m.origin.startswith(
             f"covergroup {g['name']} ({g['file']}:{g['start']})")), None)
         args = [x['name'] for x in (cg or {}).get('sample_args') or []]
         calls = self.gen.sample_calls(cg) if cg and args else []
+        groups = {}
+        for c in calls: groups.setdefault(c[0].get('fv_instance') or (cg or {}).get('name'), []).append(c)
+        if len(groups) <= 1:
+            return {(next(iter(groups)) if groups else None): self.map_calls(m, args, calls)}
+        return {inst: self.map_calls(m, args, cs) for inst, cs in groups.items()}
+
+    def map_calls(self, m, args, calls):
         out = {}
         for port in m.port_order:
             if port in ('clk', 'reset', 'sample'): continue
@@ -3699,7 +3724,7 @@ class RtlMap:
 
 
 RTL_KEYS = {'top': str, 'filelists': list, 'binds': list, 'bind_tops': list, 'defines': list, 'clock': list,
-            'reset': str, 'reset_active_low': bool, 'depth': int}
+            'reset': list, 'reset_active_low': bool, 'depth': int}
 
 
 def load_rtl_config(a):
@@ -3711,7 +3736,8 @@ def load_rtl_config(a):
         unknown = set(cfg) - set(RTL_KEYS)
         if unknown: sys.exit(f"{a.rtl_config}: unknown keys {', '.join(sorted(unknown))} (known: {', '.join(RTL_KEYS)})")
         base = os.path.dirname(os.path.abspath(a.rtl_config))
-        if isinstance(cfg.get('clock'), str): cfg['clock'] = [cfg['clock']]
+        for k in ('clock', 'reset'):        # one port or a list
+            if isinstance(cfg.get(k), str): cfg[k] = [cfg[k]]
         for k, t in RTL_KEYS.items():
             if k in cfg and not isinstance(cfg[k], t): sys.exit(f'{a.rtl_config}: {k} must be a {t.__name__}')
         for k in ('filelists', 'binds'):
@@ -3752,12 +3778,13 @@ def rtl_flow(gen, out):
             if path in bind_files or module == a.rtl_top: return None
             return f'assumption inside {module}, not on the DUT interface'
         lowered, sva = svalower.lower_filelists((a.rtl or []) + (a.rtl_bind or []), os.path.join(rd, 'sva'),
-                                                a.rtl_define or [], kinds=('assume',), keep=keep)
+                                                a.rtl_define or [], kinds=('assume',), keep=keep,
+                                                unguard=sorted(bind_files))
     rm = RtlMap(gen, lowered)
     mc = rm.mixed_edges
-    clk, rst, rst_low = list(a.rtl_clock), a.rtl_reset, a.rtl_reset_low
+    clk, rst, rst_low = list(a.rtl_clock), list(a.rtl_reset), a.rtl_reset_low
     inputs = sorted(p for p, (d, w) in rm.ports.items() if d == 'input')
-    bad = [p for p in clk + [rst] if p not in inputs]
+    bad = [p for p in clk + rst if p not in inputs]
     if bad:
         sys.exit(f"rtl config: {', '.join(bad)} not an input port of {a.rtl_top}; its inputs: {', '.join(inputs)}")
     gen.rtl_rows, gen.rtl_info = [], {'dut': a.rtl_top, 'instance': rm.dut_path, 'clock': clk, 'reset': rst,
@@ -3777,7 +3804,7 @@ def rtl_flow(gen, out):
         for p, (d, w) in rm.ports.items():
             if d == 'input':
                 if p in clk: conns.append(f'.{p}(clk)')
-                elif p == rst: conns.append(f".{p}({'!fv_rst' if rst_low else 'fv_rst'})")
+                elif p in rst: conns.append(f".{p}({'!fv_rst' if rst_low else 'fv_rst'})")
                 elif mc:
                     lines += [f'  (* anyseq *) logic [{w - 1}:0] fr_{p};', f"  logic [{w - 1}:0] in_{p} = '0;",
                               f'  always_ff @(posedge clk) in_{p} <= fr_{p};']
@@ -3793,60 +3820,72 @@ def rtl_flow(gen, out):
     jobs = []
     for m in gen.mods_cg:
         if not m.hit_order: continue
-        mp = rm.map_cg(m)
-        mapped = {p for p, (src, _) in mp.items() if src}
-        deps = cover_deps(m)
-        keep = [c for c in m.hit_order if deps.get(c) and deps[c] <= mapped]
-        m.rtl_map = {p: {'source': (list(src) if src else None), 'why': why} for p, (src, why) in mp.items()}
-        # a bin whose inputs all map to DUT input ports is reached by the (free) stimulus alone: it says
-        # nothing about the design until the inputs are constrained by a driver model
-        stim_only = {c for c in keep if all(mp[p][0][0] == 'port' and rm.ports[mp[p][0][1]][0] == 'input'
-                                            for p in deps[c])}
-        for c in m.hit_order:
-            if c not in keep:
-                gen.rtl_rows.append({'covergroup': m.name, 'cover': c, 'status': 'unmapped',
-                                     'needs': sorted((deps.get(c) or set()) - mapped)})
-        if not keep: continue
-        probes, lines = {}, dut_top('fv_rtl_top')
-        cg_conns = ['.clk(clk)', '.reset(fv_rst)', ".sample(!fv_rst)"]
-        for port in m.port_order:
-            if port in ('clk', 'reset', 'sample'): continue
-            src = mp[port][0]
-            pw = decl_width(m.ports[port][1])
-            if src is None:
-                lines.append(f'  (* anyseq *) logic [{pw - 1}:0] f_{port};')
-                cg_conns.append(f'.{port}(f_{port})'); continue
-            if src[0] == 'port':
-                d, w = rm.ports[src[1]]
-                val = f"{'in' if d == 'input' else 'out'}_{src[1]}"
-            else:
-                _, path, lo, wd = src
-                pn = probes.setdefault(path, f'pr_{len(probes)}')
-                if f'  wire [{rm.nets[path] - 1}:0] {pn};' not in lines:
-                    lines.append(f'  wire [{rm.nets[path] - 1}:0] {pn};   // u_dut.{path} (connected after flatten)')
-                val = f'{pn}[{lo + wd - 1}:{lo}]'
-            lines.append(f'  wire [{pw - 1}:0] v_{port} = {val};')
-            cg_conns.append(f'.{port}(v_{port})')
-        post = '; '.join(f'connect -nounset -set {pn} u_dut.{path}' for path, pn in probes.items())
-        pre = f'plugin -i slang; read_slang --single-unit {rm.slang_args()} {rm.top_args()}; '
-        for lo, hi in [(i, min(i + a.cover_chunk, len(keep))) for i in range(0, len(keep), a.cover_chunk)]:
-            names = keep[lo:hi]
-            top = ident('rtl_' + m.name + (f'__{lo}' if len(keep) > a.cover_chunk else ''))
-            src = '\n'.join(lines + [f'  {m.name} u_cg (' + ', '.join(cg_conns) + ');', 'endmodule']).replace(
-                'module fv_rtl_top', f'module {top}')
-            jobs.append(Job(rd, top, src, [only_covers(m, names)], a.rtl_depth, ' -DFV_NO_ILLEGAL_BINS', m, names,
-                            pre=pre, post=post, multiclock=mc))
-            jobs[-1].stim_only = stim_only
+        maps = rm.map_cg(m)
+        m.rtl_map = {}
+        for inst, mp in maps.items():
+            mapped = {p for p, (src, _) in mp.items() if src}
+            deps = cover_deps(m)
+            keep = [c for c in m.hit_order if deps.get(c) and deps[c] <= mapped]
+            tag = '' if len(maps) == 1 else f'__{inst}'          # several instances of one covergroup type
+            m.rtl_map[inst or m.name] = {p: {'source': (list(src) if src else None), 'why': why}
+                                         for p, (src, why) in mp.items()}
+            # a bin whose inputs all map to DUT input ports is reached by the (free) stimulus alone: it says
+            # nothing about the design until the inputs are constrained by a driver model
+            stim_only = {c for c in keep if all(mp[p][0][0] == 'port' and rm.ports[mp[p][0][1]][0] == 'input'
+                                                for p in deps[c])}
+            for c in m.hit_order:
+                if c not in keep:
+                    gen.rtl_rows.append({'covergroup': m.name, 'instance': inst, 'cover': c, 'status': 'unmapped',
+                                         'needs': sorted((deps.get(c) or set()) - mapped)})
+            if not keep: continue
+            probes, lines = {}, dut_top('fv_rtl_top')
+            cg_conns = ['.clk(clk)', '.reset(fv_rst)', ".sample(!fv_rst)"]
+            for port in m.port_order:
+                if port in ('clk', 'reset', 'sample'): continue
+                src = mp[port][0]
+                pw = decl_width(m.ports[port][1])
+                if src is None:
+                    lines.append(f'  (* anyseq *) logic [{pw - 1}:0] f_{port};')
+                    cg_conns.append(f'.{port}(f_{port})'); continue
+                def probe(net):
+                    _, path, lo, wd = net
+                    pn = probes.setdefault(path, f'pr_{len(probes)}')
+                    if f'  wire [{rm.nets[path] - 1}:0] {pn};' not in ''.join(lines):
+                        lines.append(f'  wire [{rm.nets[path] - 1}:0] {pn};   // u_dut.{path} (connected after flatten)')
+                    return f'{pn}[{lo + wd - 1}:{lo}]'
+                if src[0] == 'port':
+                    d, w = rm.ports[src[1]]
+                    val = f"{'in' if d == 'input' else 'out'}_{src[1]}"
+                elif src[0] == 'reg':       # a whole register: its fields' signals at their offsets
+                    rw = max(o + n[3] for o, n in src[1])
+                    val = f'rg_{port}'
+                    lines.append(f"  logic [{rw - 1}:0] {val};")
+                    lines.append(f"  always_comb begin {val} = '0; " +
+                                 ' '.join(f'{val}[{o + n[3] - 1}:{o}] = {probe(n)};' for o, n in src[1]) + ' end')
+                else:
+                    val = probe(src)
+                lines.append(f'  wire [{pw - 1}:0] v_{port} = {val};')
+                cg_conns.append(f'.{port}(v_{port})')
+            post = '; '.join(f'connect -nounset -set {pn} u_dut.{path}' for path, pn in probes.items())
+            pre = f'plugin -i slang; read_slang --single-unit {rm.slang_args()} {rm.top_args()}; '
+            for lo, hi in [(i, min(i + a.cover_chunk, len(keep))) for i in range(0, len(keep), a.cover_chunk)]:
+                names = keep[lo:hi]
+                top = ident('rtl_' + m.name + tag + (f'__{lo}' if len(keep) > a.cover_chunk else ''))
+                src = '\n'.join(lines + [f'  {m.name} u_cg (' + ', '.join(cg_conns) + ');', 'endmodule']).replace(
+                    'module fv_rtl_top', f'module {top}')
+                jobs.append(Job(rd, top, src, [only_covers(m, names)], a.rtl_depth, ' -DFV_NO_ILLEGAL_BINS', m, names,
+                                pre=pre, post=post, multiclock=mc))
+                jobs[-1].stim_only, jobs[-1].inst = stim_only, inst
     for j in jobs: j.write(gen)
     res = run_jobs(gen, jobs, a.jobs, on_done=lambda job, hits: {c: st for c, (_, st) in hits.items()})
     for job, status, rch, unr, err, steps in res:
         for c in job.names:
-            row = {'covergroup': job.m.name, 'cover': c}
+            row = {'covergroup': job.m.name, 'instance': job.inst, 'cover': c}
             if c in rch: row.update(status='reached', step=(steps or {}).get(c), inputs_only=c in job.stim_only)
             elif status in ('PASS', 'FAIL') and c in unr: row['status'] = 'unreached'
             else: row.update(status='error' if status == 'ERROR' else 'timeout', error=err)
             gen.rtl_rows.append(row)
-    gen.rtl_info['maps'] = {m.name: m.rtl_map for m in gen.mods_cg if getattr(m, 'rtl_map', None)}
+    gen.rtl_info['maps'] = {m.name: m.rtl_map for m in gen.mods_cg if getattr(m, 'rtl_map', None)}   # per instance
     gen.rtl_info['depth'] = a.rtl_depth
     return gen.rtl_rows
 
@@ -3967,7 +4006,9 @@ def report_md(rep):
                    'from reset. DUT inputs are free (no driver model yet: a reached bin may use input sequences the '
                    'protocol forbids). Covergroups are sampled every cycle, so a bin is reached when the design ever '
                    'holds that value, whenever the testbench would sample it. **reached**: the design gets there (a bin '
-                   'that reads only DUT inputs is marked: free inputs reach it trivially); '
+                   'that reads only DUT inputs is marked: free inputs reach it trivially; a register-model read maps to the '
+                   'register\'s RTL value, which for hardware-backed fields can differ from the model\'s mirror of '
+                   'what software wrote); '
                    '**unreached**: not within the bound; **unmapped**: an input has no RTL counterpart.\n')
         for n in info.get('notes') or []: out.append(f'- note: {n}')
         if info.get('multiclock'):
@@ -3983,10 +4024,13 @@ def report_md(rep):
             for x in sva:
                 if x['why'] and x['status'] == 'unsupported': why[x['why'][:80]] = why.get(x['why'][:80], 0) + 1
             for w, n in sorted(why.items(), key=lambda kv: -kv[1])[:12]: out.append(f'  - not lowered ({n}): {w}')
-        for mname, mp in (info.get('maps') or {}).items():
-            out.append(f'- `{mname}` inputs:')
+        for mname, insts in (info.get('maps') or {}).items():
+          for inst, mp in insts.items():
+            out.append(f'- `{mname}`' + (f' instance `{inst}`' if inst and inst != mname else '') + ' inputs:')
             for port, x in mp.items():
-                out.append(f"  - `{port}`: {'**' + str(x['source'][1]) + '**' if x['source'] else 'free'} ({x['why']})")
+                src = x['source']
+                label = ('**' + (str(src[1]) if src[0] in ('port', 'net') else 'register') + '**') if src else 'free'
+                out.append(f"  - `{port}`: {label} ({x['why']})")
         cnt = {}
         for r in rep['rtl']: cnt[r['status']] = cnt.get(r['status'], 0) + 1
         out.append('- ' + ', '.join(f'{k}: {v}' for k, v in sorted(cnt.items())) + '\n')
@@ -3994,7 +4038,8 @@ def report_md(rep):
             extra = f" (needs {', '.join(r['needs'])})" if r.get('needs') else (f" ({r['error']})" if r.get('error') else
                      (f" at cycle {r['step']}" if r.get('step') is not None else ''))
             if r.get('inputs_only'): extra += ' (only DUT inputs: reached by the free stimulus, not the design)'
-            out.append(f"- **{r['status']}** `{r['covergroup']}.{r['cover']}`{extra}")
+            inst = f"[{r['instance']}]" if r.get('instance') and r['instance'] not in r['covergroup'] else ''
+            out.append(f"- **{r['status']}** `{r['covergroup']}{inst}.{r['cover']}`{extra}")
         out.append('')
     if rep.get('replay') is not None:
         rows = rep['replay']
@@ -4093,7 +4138,7 @@ def main():
     ap.add_argument('--rtl-define', action='append', help='define for reading the RTL (repeatable)')
     ap.add_argument('--rtl-depth', type=int, default=None, help='cycles explored from reset (default 40)')
     ap.add_argument('--rtl-clock', action='append', help='DUT clock input port (repeatable)')
-    ap.add_argument('--rtl-reset', help='DUT reset input port')
+    ap.add_argument('--rtl-reset', action='append', help='DUT reset input port (repeatable: all driven together)')
     ap.add_argument('--rtl-reset-low', type=lambda v: v.lower() in ('1', 'true', 'yes'), default=None,
                     help='true: the reset is active low')
     ap.add_argument('--rtl-bind', action='append', help='slang argument file with the testbench\'s bind modules '

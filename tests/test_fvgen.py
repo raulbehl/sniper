@@ -772,8 +772,10 @@ depth = 14
     rep = json.load(open(os.path.join(work, 'fv', 'report.json')))
     info = rep['rtl_info']
     assert (info['instance'], info['clock'], info['reset'], info['reset_active_low']) == \
-        ('rf_tb.dut', ['clk_i'], 'rst_ni', True)
-    src = {m: {p: (x['source'] or [None])[0:2] for p, x in mp.items()} for m, mp in info['maps'].items()}
+        ('rf_tb.dut', ['clk_i'], ['rst_ni'], True)
+    # one instance per covergroup here: its mapping
+    src = {m: {p: (x['source'] or [None])[0:2] for p, x in next(iter(insts.values())).items()}
+           for m, insts in info['maps'].items()}
     assert src['fv_cg_rf_cov__lvl_cg'] == {'lvl': ['port', 'level_o']}         # rif.level = lvl = level_o
     assert src['fv_cg_rf_cov__busy_cg'] == {'b': ['net', 'busy']}              # rif.busy = dut.busy
     assert src['fv_cg_rf_cov__mode_cg'] == {'m': ['net', 'cfg_q']}             # register model HDL path
@@ -789,6 +791,13 @@ depth = 14
     assert rows['cov_cp_mode__auto_3']['status'] == 'unreached'
     assert (rows['cov_cp_busy__auto_0'].get('step'), rows['cov_cp_busy__auto_1'].get('step')) == (4, 5)
     assert rows['cov_cp_x__one']['status'] == 'unmapped'
+    # one covergroup type, two instances on different sources: per-instance results (the level reaches 8,
+    # the 2-bit config register never does)
+    hi = {(r['instance'], r['cover']): r['status'] for r in rep['rtl'] if r['covergroup'].endswith('__hi_cg')}
+    assert hi == {('lvl_hi', 'cov_cp_v__hi'): 'reached', ('lvl_hi', 'cov_cp_v__low'): 'reached',
+                  ('cfg_hi', 'cov_cp_v__hi'): 'unreached', ('cfg_hi', 'cov_cp_v__low'): 'reached'}, hi
+    # a whole register read: its fields at their offsets (cfg_q never 3 under the assumption)
+    assert (rows['cov_cp_r__two']['status'], rows['cov_cp_r__three']['status']) == ('reached', 'unreached')
     # a covergroup on a DUT input is reached by the free stimulus alone, and says so
     assert src['fv_cg_rf_cov__wr_cg'] == {'w': ['port', 'wr_i']}
     assert rows['cov_cp_wr__auto_1']['inputs_only'] and not rows['cov_cp_lvl__l__3']['inputs_only']

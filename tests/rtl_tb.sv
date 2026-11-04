@@ -18,6 +18,7 @@ package rf_pkg;
     function uvm_reg_data_t get_mirrored_value(); return m; endfunction
   endclass
   class uvm_reg;
+    function uvm_reg_data_t get_mirrored_value(); return 0; endfunction
     function void add_hdl_path_slice(string name, int offset, int size, bit first = 0, string kind = "RTL");
     endfunction
   endclass
@@ -42,7 +43,16 @@ package rf_pkg;
     endfunction
   endclass
 
+  // a covergroup type declared outside the class, instantiated twice with different sources
+  covergroup hi_cg with function sample(bit [3:0] v);
+    cp_v : coverpoint v { bins hi = {[8:15]}; bins low = {[0:7]}; }
+  endgroup
+
   class rf_cov;
+    hi_cg lvl_hi, cfg_hi;
+    covergroup reg_cg with function sample(bit [31:0] r);
+      cp_r : coverpoint r[1:0] { bins two = {2}; bins three = {3}; }
+    endgroup
     covergroup lvl_cg with function sample(int lvl);
       cp_lvl : coverpoint lvl { bins l[] = {[0:8]}; bins never = {12}; }
     endgroup
@@ -58,7 +68,10 @@ package rf_pkg;
     covergroup tb_cg with function sample(int x);
       cp_x : coverpoint x { bins one = {1}; }
     endgroup
-    function new(); lvl_cg = new(); mode_cg = new(); busy_cg = new(); wr_cg = new(); tb_cg = new(); endfunction
+    function new();
+      lvl_cg = new(); mode_cg = new(); busy_cg = new(); wr_cg = new(); tb_cg = new(); reg_cg = new();
+      lvl_hi = new(); cfg_hi = new();
+    endfunction
   endclass
 
   class rf_scoreboard;
@@ -73,6 +86,9 @@ package rf_pkg;
         cov.mode_cg.sample(ral.cfg.mode.get_mirrored_value());
         cov.busy_cg.sample(vif.busy);
         cov.wr_cg.sample(vif.wr);
+        cov.reg_cg.sample(ral.cfg.get_mirrored_value());           // a whole register
+        cov.lvl_hi.sample(vif.level);
+        cov.cfg_hi.sample(ral.cfg.mode.get_mirrored_value());
         cov.tb_cg.sample(model_x);
       end
     endtask
