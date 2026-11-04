@@ -1,9 +1,0 @@
-# running in formal_cover/src/
-plugin -i slang
-read_slang axi_pkg.sv qs_find_first.sv qs_pop_cnt.sv axi_master.sv --top axi_master
-read_verilog -sv -formal -DFORMAL fv_constraints.sv axi_fv_top.sv
-prep -top axi_fv_top
-hierarchy -smtcheck
-rename -witness
-write_jny -no-connections ../model/design.json
-write_rtlil ../model/design.il
