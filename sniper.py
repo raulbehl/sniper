@@ -168,6 +168,18 @@ def enum_name(v):
     return None
 
 
+def ral_kind(c):
+    """'block' / 'reg' for a UVM register-model class, else None"""
+    names, b = [], c
+    for _ in range(12):
+        b = getattr(b, 'baseClass', None)
+        if b is None: break
+        names.append(getattr(b, 'name', ''))
+    if 'uvm_reg_block' in names: return 'block'
+    if 'uvm_reg' in names: return 'reg'
+    return None
+
+
 def mode_call(x, name):
     """obj.blk.constraint_mode(v) / obj.fld.rand_mode(v) / obj.constraint_mode(v): receiver object,
     block or field (None: every one of the object's), new mode. The getter forms take no argument."""
@@ -455,24 +467,27 @@ def analyse(body, loc, ser):
                              'vif_reads', 'signal_writes', 'signal_reads', 'field_writes', 'field_reads')}
     if body is None: return facts
     lhs_ids = set()
-    tainted = set()         # locals assigned (directly or through other locals) from interface signals
+    tainted = {}            # local -> the interface signal it was assigned from (directly or via locals)
 
     def ln(x): return loc.line(x.sourceRange)
 
     def reads_vif(e):
-        """the expression reads a virtual-interface signal, or a local holding one"""
+        """{'iface', 'signal'} of the virtual-interface signal the expression reads (directly or through
+        a local holding one), else None"""
         found = []
         def cb(n):
             if found: return False
             if isinstance(n, A.Expression) and n.kind.name in ('MemberAccess', 'NamedValue', 'HierarchicalValue'):
                 r = classify_ref(n)
-                if r is not None and ((r['what'] == 'vif' and r['signal']) or
-                                      (r['what'] == 'local' and r['path'].split('.')[0] in tainted)):
-                    found.append(True); return False
+                if r is not None and r['what'] == 'vif' and r['signal']:
+                    # clocking block members: the signal is the last name (vif.cb.sig -> sig)
+                    found.append({'iface': r['iface'], 'signal': r['signal'].split('.')[-1]}); return False
+                if r is not None and r['what'] == 'local' and r['path'].split('.')[0] in tainted:
+                    found.append(tainted[r['path'].split('.')[0]]); return False
             return True
         try: e.visit(cb)
         except Exception: pass
-        return bool(found)
+        return found[0] if found else None
 
     def fn(x):
         k = x.kind.name
@@ -488,9 +503,10 @@ def analyse(body, loc, ser):
             entry = {'line': ln(x), 'src': text(x, 200), 'nonblocking': x.isNonBlocking,
                      'rhs_const': const_str(x.right)}
             if r is None: return
-            if reads_vif(x.right):
-                entry['rhs_vif'] = True        # the value comes from the DUT (a monitor-style copy)
-                if r['what'] == 'local': tainted.add(r['path'].split('.')[0])
+            src = reads_vif(x.right)
+            if src:
+                entry['rhs_vif'] = src         # the value comes from the DUT (a monitor-style copy)
+                if r['what'] == 'local': tainted[r['path'].split('.')[0]] = src
             if r['what'] == 'vif' and not r['signal']:      # vif = cfg.vif : handle assignment
                 facts['field_writes'].append({'what': 'field', 'path': r['handle'], 'field': r['handle'],
                                               'via_handle': False, 'vif_handle': True, **entry})
@@ -785,6 +801,7 @@ class Extractor:
         self.covergroups, self.assertions = [], []
         self.types = {'parameters': [], 'typedefs': [], 'enums': []}
         self.imported_pkgs = set()
+        self.ral_classes = {}         # path -> uvm_reg_block / uvm_reg subclass (any file)
         self.default_specs = set()      # (path, line, name) of classes reported by default specialization
         self.callees = {}               # path -> subroutine called from an own constraint
         self.seen = set()
@@ -825,6 +842,8 @@ class Extractor:
             k = s.kind.name
             if k == 'Package' and s.name in wanted_pkgs:
                 self.type_scope(s, s.name)
+            if k == 'ClassType' and ral_kind(s):      # register models are generated outside --own
+                self.ral_classes.setdefault(s.hierarchicalPath, s)
             sl = getattr(s, 'location', None)
             if not sl: return A.VisitAction.Advance
             path, line, macro = self.loc.resolve(sl)
@@ -1234,7 +1253,7 @@ class Extractor:
                'kind': 'interface' if i.isInterface else 'module', 'own': own,
                'params': [], 'ports': [], 'connections': []}
         body = i.body
-        signals, modports, children = [], [], []
+        signals, modports, children, assigns = [], [], [], []
         for m in body:
             mk = m.kind.name
             if mk == 'Parameter':
@@ -1250,6 +1269,10 @@ class Extractor:
                 t = m.type
                 signals.append({'name': m.name, 'type': str(t), 'width': t.bitWidth if t.isIntegral else None,
                                 'init': text(m.initializer) if getattr(m, 'initializer', None) is not None else None})
+            elif mk == 'ContinuousAssign' and (own or i.isInterface):
+                a = m.assignment
+                if a is not None and a.kind.name == 'Assignment':
+                    assigns.append({'lhs': text(a.left), 'rhs': text(a.right), 'line': self.where(m)[1]})
             elif mk == 'Modport':
                 modports.append({'name': m.name, 'ports': [{'name': p.name, 'dir': enum_name(p.direction)}
                                                            for p in m if p.kind.name == 'ModportPort']})
@@ -1265,7 +1288,65 @@ class Extractor:
             ent['signals'] = signals
         if modports: ent['modports'] = modports
         if children: ent['children'] = children
+        if assigns: ent['assigns'] = assigns
         return ent
+
+    # ---- UVM register model: field bit positions and HDL paths (backdoor), any file
+    def ral(self):
+        """{'blocks': {block class: {'roots': [path], 'regs': {reg property: {'class', 'slices'}}}},
+        'regs': {reg class: {field: {'lsb', 'size', 'access'}}}} from the build() methods:
+        uvm_reg_field::configure(parent, size, lsb_pos, access, ..), uvm_reg::add_hdl_path_slice(name,
+        offset, size, ..), uvm_reg_block::set_hdl_path_root / add_hdl_path"""
+        out = {'blocks': {}, 'regs': {}}
+        def strip(e):
+            while e is not None and e.kind.name == 'Conversion': e = e.operand
+            return e
+        def sval(e):
+            e = strip(e)
+            if e is None: return None
+            if e.kind.name == 'StringLiteral': return e.rawValue.strip('"')
+            v = const_str(e)
+            return v.strip('"') if v else None
+        def ival(e):
+            e = strip(e)
+            v = const_str(e) or (text(e) if e is not None else None)
+            if not v: return None
+            v = v.replace('_', '')
+            m = re.fullmatch(r"(?:\d+)?'[sS]?([dDhHbBoO])([0-9a-fA-F]+)", v)
+            try: return int(m.group(2), {'d': 10, 'h': 16, 'b': 2, 'o': 8}[m.group(1).lower()]) if m else int(v)
+            except ValueError: return None
+        for path, c in self.ral_classes.items():
+            kind = ral_kind(c)
+            b = c.find('build')
+            if b is None or getattr(b, 'body', None) is None: continue
+            calls = []
+            def cb(n):
+                if isinstance(n, A.CallExpression) and n.subroutineName in (
+                        'configure', 'add_hdl_path_slice', 'set_hdl_path_root', 'add_hdl_path'):
+                    calls.append(n)
+                return True
+            try: b.body.visit(cb)
+            except Exception: continue
+            for x in calls:
+                recv = getattr(x, 'thisClass', None)
+                rsym = getattr(recv, 'symbol', None) if recv is not None else None
+                args = list(x.arguments)
+                nm = x.subroutineName
+                if kind == 'reg' and nm == 'configure' and rsym is not None and len(args) >= 4:
+                    out['regs'].setdefault(path, {})[rsym.name] = {'lsb': ival(args[2]), 'size': ival(args[1]),
+                                                                   'access': sval(args[3])}
+                elif kind == 'block' and nm == 'add_hdl_path_slice' and rsym is not None and len(args) >= 3:
+                    try: rc = rsym.type.hierarchicalPath
+                    except Exception: rc = None
+                    reg = out['blocks'].setdefault(path, {'roots': [], 'regs': {}})['regs'].setdefault(
+                        rsym.name, {'class': rc, 'slices': []})
+                    reg['slices'].append({'path': sval(args[0]), 'offset': ival(args[1]), 'size': ival(args[2]),
+                                          'kind': sval(args[4]) if len(args) > 4 else None})
+                elif kind == 'block' and nm in ('set_hdl_path_root', 'add_hdl_path') and recv is None and args:
+                    blk = out['blocks'].setdefault(path, {'roots': [], 'regs': {}})
+                    root = {'path': sval(args[0]), 'kind': sval(args[1]) if len(args) > 1 else None}
+                    if root not in blk['roots']: blk['roots'].append(root)
+        return out
 
     # ---- assemble
     def run(self):
@@ -1349,7 +1430,7 @@ class Extractor:
             cg['owner'] = min(owners, key=lambda c: c['end'] - c['start'])['name'] if owners else None
 
         hierarchy = [self.instance(t, 0) for t in self.comp.getRoot().topInstances]
-        return {'types': self.types, 'imported_packages': sorted(self.imported_pkgs),
+        return {'types': self.types, 'imported_packages': sorted(self.imported_pkgs), 'ral': self.ral(),
                 'classes': class_ents, 'subroutines': subs, 'procedures': procs,
                 'randomization': rand, 'stimulus': stim,
                 'config': {'defaults': defaults, 'overrides': overrides},

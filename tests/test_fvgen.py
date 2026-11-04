@@ -7,6 +7,9 @@
       finds satisfies the generated assumes, and tuples the assumes accept are accepted by Verilator
   T3  coverage: bins and transition monitors vs a reference model of LRM 19.5 on random sample traces
   R   regressions from real testbenches (tests/fv_regress_a.sv, fv_regress_b.sv), smoke-run with sby
+  T5  --rtl (tests/rtl_dut.sv, rtl_tb.sv): covergroup inputs traced to the DUT (port through a testbench net,
+      internal net through a testbench assign, register field through the register model's HDL path);
+      bins reached on the design at the cycles it allows, an impossible bin unreached, a testbench value unmapped
   T4  --witness / fv_replay.sv (tests/fv_witness.sv): every bin reached formally is hit in Verilator by the
       generated override class under several seeds; bins found unreachable are never hit by plain randomize()
 
@@ -733,6 +736,38 @@ endmodule
     return checked, len(rows_all)
 
 
+def test_rtl_covers():
+    work = tempfile.mkdtemp(prefix='fvt5_')
+    js = os.path.join(work, 'r.json')
+    run([PY, os.path.join(ROOT, 'sniper.py'), '--own', HERE, '-o', js, '--', '--top', 'rf_tb',
+         os.path.join(HERE, 'rtl_dut.sv'), os.path.join(HERE, 'rtl_tb.sv')])
+    d = json.load(open(js))
+    assert d['meta']['errors'] == 0, d['meta']['error_list']
+    open(os.path.join(work, 'rtl.f'), 'w').write(os.path.join(HERE, 'rtl_dut.sv') + '\n')
+    run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl', 'rtl.f', '--rtl-top', 'rf_dut',
+         '--rtl-depth', '14'], cwd=work)
+    rep = json.load(open(os.path.join(work, 'fv', 'report.json')))
+    info = rep['rtl_info']
+    assert (info['instance'], info['clock'], info['reset'], info['reset_active_low']) == \
+        ('rf_tb.dut', ['clk_i'], 'rst_ni', True)
+    src = {m: {p: (x['source'] or [None])[0:2] for p, x in mp.items()} for m, mp in info['maps'].items()}
+    assert src['fv_cg_rf_cov__lvl_cg'] == {'lvl': ['port', 'level_o']}         # rif.level = lvl = level_o
+    assert src['fv_cg_rf_cov__busy_cg'] == {'b': ['net', 'busy']}              # rif.busy = dut.busy
+    assert src['fv_cg_rf_cov__mode_cg'] == {'m': ['net', 'cfg_q']}             # register model HDL path
+    assert src['fv_cg_rf_cov__tb_cg'] == {'x': [None]}                          # testbench state
+    rows = {r['cover']: r for r in rep['rtl']}
+    # reset is released at cycle 3; one write per cycle: level k first at cycle 4 + k, never above 8
+    assert [rows[f'cov_cp_lvl__l__{k}'].get('step') for k in range(9)] == [4 + k for k in range(9)]
+    assert rows['cov_cp_lvl__never']['status'] == 'unreached'
+    # internal nets (probes): cfg_q is 0 out of reset and takes a written value one cycle later; busy
+    # (level > cfg) needs a write first. A probe left unconnected would be free: everything at cycle 4
+    assert [rows[f'cov_cp_mode__auto_{v}'].get('step') for v in range(4)] == [4, 5, 5, 5]
+    assert (rows['cov_cp_busy__auto_0'].get('step'), rows['cov_cp_busy__auto_1'].get('step')) == (4, 5)
+    assert rows['cov_cp_x__one']['status'] == 'unmapped'
+    shutil.rmtree(work, ignore_errors=True)
+    return len(rows)
+
+
 if __name__ == '__main__':
     n = test_expression_equivalence()
     print(f'T1: {n} expressions equivalent to slang')
@@ -744,5 +779,7 @@ if __name__ == '__main__':
     print(f'R: {nm} modules from the regression sources, {nc} covers reached, one unsat set with its core')
     test_smoke_timeout()
     print('R: smoke timeout kills the solver process group')
+    nr = test_rtl_covers()
+    print(f'T5: {nr} bins run on the RTL with their inputs traced to the design')
     n, nb = test_witness_replay()
     print(f'T4: {n} (bin, seed) replays hit their bin in Verilator ({nb} bins)')

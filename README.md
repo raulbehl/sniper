@@ -150,6 +150,30 @@ the class cannot set: monitor data, testbench state; listed with the witness val
 constraints: no seed will hit it). Assumptions are listed per bin (sampling conditions on other
 objects are taken as true). `--covergroups REGEX` limits the run.
 
+### Covergroups on the RTL: `--rtl`
+
+```sh
+python fvgen.py tb.json -o fv/ --rtl rtl.f --rtl-top uart [--rtl-depth 40]
+```
+
+`rtl.f` holds the slang arguments of the DUT RTL (read with yosys-slang). fvgen builds a formal top
+with the DUT (inputs free, the reset port held for three cycles) and runs each covergroup whose
+inputs it can trace into the design, sampled every cycle, so a bin is reached when the design ever
+holds that value. Inputs are traced from the extraction alone:
+
+- `sample()` arguments that read a virtual interface signal: through the interface instance in the
+  testbench top to the DUT port it is connected to (directly or via a net), or to the DUT-internal
+  signal a continuous assign taps (`assign nf_if.rx_sync = dut.uart_core.rx_sync`);
+- register-model reads (`ral.reg.field.get_mirrored_value()`): the field's bits in the register's
+  backdoor HDL path (`add_hdl_path_slice`, relative to `set_hdl_path_root`);
+- fields of a monitored object that a monitor copies from an interface signal.
+
+DUT-internal signals are probed after flattening. The report lists, per covergroup input, the RTL
+signal it maps to and why; per bin **reached** (with the cycle), **unreached** (not within
+`--rtl-depth`: no proof), or **unmapped** (an input with no RTL counterpart: testbench state). Not
+yet: input constraints from the drivers, and the testbench's concurrent SVA (yosys-slang reads
+immediate assertions only), so a reached bin may use input sequences the bus protocol forbids.
+
 Coverage semantics (clause 19): value bins, `[]` (one per value) and `[N]` (values split in order,
 remainder in the last), wildcard, `with` filters, `iff`, ignore/illegal values removed from every
 other bin (fully excluded bins dropped), `default`, automatic bins (enum values, or 2^w values over
@@ -169,7 +193,8 @@ cores, ...) through sniper, fvgen and the smoke runs, and checks a hung solver i
 **T4** runs `--witness` on `tests/fv_witness.sv` (class covergroup with transitions/at_least/crosses,
 a collector sampled under a `case` on a rand field and an `if` on testbench state) and replays every
 reached bin in Verilator with its real constraint solver under three seeds: each must be hit, and a
-bin formal found unreachable is never hit in 2000 plain calls.
+bin formal found unreachable is never hit in 2000 plain calls; **T5** runs `--rtl` on `tests/rtl_dut.sv` /
+`rtl_tb.sv` (a DUT port, an internal net, a register field) and checks the cycle each bin is first reached.
 
 ## Notes
 

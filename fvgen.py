@@ -1858,9 +1858,11 @@ class Gen:
             if not isinstance(n, dict): return
             k = n.get('k')
             if k == 'Call' and n.get('subroutineName') == 'sample':
-                sym = (n.get('thisClass') or {}).get('symbol') or {}
-                if sym.get('path') == cg['path'] or (sym.get('sym') == cg['name'] and
-                                                     sym.get('path', '').endswith('::' + cg['name'])):
+                tc = n.get('thisClass') or {}
+                sym = tc.get('symbol') or tc.get('member') or {}     # cg.sample() / obj.cg.sample()
+                p = sym.get('path', '')
+                if p in (cg['path'], f"{cg['path']}::{cg['name']}") or (sym.get('sym') == cg['name'] and
+                                                                         p.endswith('::' + cg['name'])):
                     out.append((n, path))
             if k == 'Conditional':
                 conds = [c.get('expr') for c in n.get('conditions') or [] if c.get('expr')]
@@ -3163,9 +3165,10 @@ class Job:
     """one SymbiYosys cover run: a top, the generated modules it needs (written next to it, so a job
     does not parse every module), and the covers it is responsible for"""
 
-    def __init__(self, d, top, src, mods, depth, defs, m, names=None, traces=False):
+    def __init__(self, d, top, src, mods, depth, defs, m, names=None, traces=False, pre='', post=''):
         self.d, self.top, self.src, self.mods, self.depth, self.defs = d, top, src, mods, depth, defs
         self.m, self.names, self.traces = m, names, traces
+        self.pre, self.post = pre, post     # yosys commands before reading the top / after flattening
 
     PREP = ('hierarchy -smtcheck; scc -select; simplemap; select -clear; memory_nordff; async2sync; '
             'chformal -assume -early; opt_clean; formalff -setundef -clk2ff -ff2anyinit -hierarchy; '
@@ -3178,8 +3181,10 @@ class Job:
         solver, which dominated the run time. A VCD only when the job needs traces."""
         out_dir = os.path.abspath(os.path.dirname(self.d))     # the job runs inside smoke/ or witness/
         wires = ' -wires' if self.traces else ''
-        ys = (f'read_verilog -sv -formal -DFORMAL{self.defs} -I{out_dir} {self.top}_lib.sv {self.top}.sv; '
-              f'prep -top {self.top}; {self.PREP}; write_smt2{wires} {self.top}/model.smt2')
+        # probes into the DUT are connected right after flattening, before optimisation drops wires
+        post = f'hierarchy -top {self.top}; proc; flatten; {self.post}; ' if self.post else ''
+        ys = (f'{self.pre}read_verilog -sv -formal -DFORMAL{self.defs} -I{out_dir} {self.top}_lib.sv {self.top}.sv; '
+              f'{post}prep -top {self.top}; {self.PREP}; write_smt2{wires} {self.top}/model.smt2')
         smt = ['yosys-smtbmc', '-s', gen.a.solver, '--presat', '--unroll', '-c', '--noprogress', '-t', str(self.depth)]
         if self.traces: smt += ['--dump-vcd', f'{self.top}/trace%.vcd']
         return ['yosys', '-q', '-p', ys], smt + [f'{self.top}/model.smt2']
@@ -3508,6 +3513,243 @@ def replay_class(gen, c, covers):
     return '\n'.join(L)
 
 
+class RtlMap:
+    """Where each covergroup input lives in the DUT, from the extraction: the testbench top's DUT
+    instance and its port connections, the top's continuous assigns into the DUT, the register
+    model's HDL paths, and the interface signals monitors copy into objects."""
+
+    def __init__(self, gen):
+        self.gen, self.d, self.a = gen, gen.d, gen.a
+        self.notes = []
+        self.tb = self.inst = None
+        for top in self.d['hierarchy']:
+            for ch in top.get('children') or []:
+                if ch.get('definition') == self.a.rtl_top and ch.get('kind') == 'module':
+                    self.tb, self.inst = top, ch
+                    break
+            if self.inst: break
+        if self.inst is None:
+            sys.exit(f'--rtl-top {self.a.rtl_top}: no instance of it in a testbench top of the extraction')
+        self.dut_path = f"{self.tb['name']}.{self.inst['name']}"
+        self.conns = {c['port']: c['expr'] for c in self.inst.get('connections') or []}
+        self.assigns = self.tb.get('assigns') or []
+        self.ifaces = {}
+        for ch in self.tb.get('children') or []:
+            if ch.get('kind') == 'interface': self.ifaces.setdefault(ch['definition'], []).append(ch['name'])
+        self.ports, self.nets = self.discover()
+
+    def slang_args(self):
+        args = []
+        for f in self.a.rtl or []: args += ['-f', os.path.abspath(f)]
+        for dfn in self.a.rtl_define or []: args.append(f'-D{dfn}')
+        return ' '.join(args)
+
+    def discover(self):
+        """the DUT's ports and internal signals (name -> width) as yosys-slang elaborates it"""
+        with tempfile.TemporaryDirectory(prefix='fvrtl_') as d:
+            js = os.path.join(d, 'dut.json')
+            r = subprocess.run(['yosys', '-q', '-p', f'plugin -i slang; read_slang --single-unit {self.slang_args()} '
+                                f'--top {self.a.rtl_top}; write_json -noscopeinfo {js}'],
+                               capture_output=True, text=True)
+            if r.returncode or not os.path.exists(js):
+                sys.exit('reading the DUT with yosys-slang failed:\n' + (r.stdout + r.stderr)[-2000:])
+            m = json.load(open(js))['modules'][self.a.rtl_top]
+        ports = {n: (p['direction'], len(p['bits'])) for n, p in m['ports'].items()}
+        nets = {n: len(x['bits']) for n, x in m['netnames'].items() if not n.startswith('$')}
+        return ports, nets
+
+    # ---- sources: ('port', name) a DUT port, ('net', path, lo, width) a DUT-internal signal
+    def ifsig(self, iface, sig):
+        insts = self.ifaces.get(iface, [])
+        if len(insts) != 1:
+            return None, (f'interface {iface}: {len(insts)} instances in {self.tb["name"]}' if insts else
+                          f'interface {iface} is not instantiated in {self.tb["name"]}')
+        key = f'{insts[0]}.{sig}'
+        dut = self.inst['name'] + '.'
+        for a in self.assigns:              # assign ifc.sig = dut.internal
+            if a['lhs'] == key and a['rhs'].startswith(dut):
+                return self.net(a['rhs'][len(dut):]), f"{key} = {a['rhs']} ({self.tb['name']}:{a.get('line')})"
+        for port, expr in self.conns.items():
+            if expr == key: return ('port', port), f'{key} on DUT port {port}'
+        for a in self.assigns:              # net = ifc.sig into a DUT input / ifc.sig = net from an output
+            other = a['lhs'] if a['rhs'] == key else (a['rhs'] if a['lhs'] == key else None)
+            for port, expr in self.conns.items():
+                if other is not None and expr == other: return ('port', port), f'{key} via {other} on DUT port {port}'
+        return None, f'{key} is not connected to the DUT in {self.tb["name"]}'
+
+    def net(self, path, lo=0, width=None):
+        base = re.sub(r'\[[^\]]*\]$', '', path) if path not in self.nets else path
+        w = self.nets.get(base)
+        if w is None: return None
+        return ('net', base, lo, width if width is not None else w)
+
+    def ral(self, call):
+        """reg.field.get_mirrored_value() / get(): the field's bits in the register model's HDL path"""
+        tc = strip_conv(call.get('thisClass') or {})
+        if tc.get('k') != 'MemberAccess': return None, 'register field not recognised'
+        field = tc['member']['sym']
+        regn = strip_conv(tc.get('value') or {})
+        reg = (regn.get('member') or {}).get('sym') if regn.get('k') == 'MemberAccess' else (regn.get('symbol') or {}).get('sym')
+        ral = self.d.get('ral') or {}
+        for blk, b in ral.get('blocks', {}).items():
+            r = b['regs'].get(reg)
+            if not r: continue
+            f = (ral['regs'].get(r['class']) or {}).get(field)
+            if not f or f['lsb'] is None: return None, f'{reg}.{field}: field position unknown'
+            roots = [x['path'] for x in b['roots'] if x['path']]
+            for sl in r['slices']:
+                if sl['offset'] is None or sl['size'] is None: continue
+                if sl['offset'] <= f['lsb'] and f['lsb'] + f['size'] <= sl['offset'] + sl['size']:
+                    if roots and self.dut_path not in roots:
+                        self.notes.append(f'register model root {roots} is not the DUT instance {self.dut_path}')
+                    src = self.net(sl['path'], f['lsb'] - sl['offset'], f['size'])
+                    if src is None: return None, f"{reg}.{field}: HDL path {sl['path']} not found in the DUT"
+                    return src, f"{reg}.{field} -> {sl['path']}[{f['lsb'] - sl['offset'] + f['size'] - 1}:{f['lsb'] - sl['offset']}]"
+            return None, f'{reg}.{field}: no HDL path slice covers it'
+        return None, f'{reg}.{field}: register not in the register model'
+
+    def expr(self, e):
+        """source of a sample() argument"""
+        e = strip_conv(e or {})
+        if e.get('k') == 'Call' and e.get('subroutineName') in ('get_mirrored_value', 'get') and e.get('thisClass'):
+            return self.ral(e)
+        chain, x = [], e
+        while x.get('k') in ('MemberAccess', 'ElementSelect'):
+            if x['k'] == 'MemberAccess': chain.append(x['member']['sym'])
+            x = strip_conv(x.get('value') or {})
+        ty = x.get('ty', '') if x.get('k') == 'NamedValue' else ''
+        iface = re.sub(r'^virtual\s+(interface\s+)?', '', ty).split('.')[0].split('#')[0].strip()
+        if chain and iface in self.ifaces:      # a virtual interface handle: vif[.clocking].signal
+            return self.ifsig(iface, chain[0])
+        return None, f"{e.get('src') or e.get('k')}: testbench value (no RTL counterpart)"
+
+    def field(self, cls, path):
+        """a field of the sampled class that a monitor copies from an interface signal"""
+        for c in self.gen.chain(cls):
+            mp = f"{c['path']}::{path[0]}"
+            for r in self.d['subroutines'] + self.d.get('procedures', []):
+                for w in (r.get('facts') or {}).get('field_writes', []):
+                    v = w.get('rhs_vif')
+                    if w.get('member_path') == mp and isinstance(v, dict):
+                        src, why = self.ifsig(v['iface'], v['signal'])
+                        if src: return src, f"{'.'.join(path)} <- {v['iface']}.{v['signal']} ({r.get('name')}); {why}"
+        return None, f"{'.'.join(path)}: not copied from an interface signal"
+
+    def map_cg(self, m):
+        """port -> (source or None, why) for one covergroup module"""
+        cg = next((g for g in self.d['coverage']['covergroups'] if m.origin.startswith(
+            f"covergroup {g['name']} ({g['file']}:{g['start']})")), None)
+        args = [x['name'] for x in (cg or {}).get('sample_args') or []]
+        calls = self.gen.sample_calls(cg) if cg and args else []
+        out = {}
+        for port in m.port_order:
+            if port in ('clk', 'reset', 'sample'): continue
+            origin = m.res.origin.get(port, port)
+            root = origin.split('.')[0]
+            best, why = None, []
+            if root in args and '.' not in origin:
+                i = args.index(root)
+                for call, _ in calls:
+                    a = call.get('arguments') or []
+                    if i < len(a):
+                        src, w = self.expr(a[i])
+                        why.append(w)
+                        if src and best is None: best = src
+            elif port in m.res.src:
+                cls, path = m.res.src[port]
+                best, w = self.field(cls, path)
+                why.append(w)
+            else:
+                why.append('no sample() call or class field to trace')
+            out[port] = (best, '; '.join(dict.fromkeys(why)) or 'no sample() call found')
+        return out
+
+
+def rtl_flow(gen, out):
+    """the DUT in the formal model: each covergroup whose inputs map to DUT signals is sampled
+    every cycle on the RTL (DUT inputs free, reset held for the first cycles); every bin it can
+    reach within --rtl-depth is reached by the design itself"""
+    rm = RtlMap(gen)
+    rd = os.path.join(out, 'rtl')
+    os.makedirs(rd, exist_ok=True)
+    a = gen.a
+    clk = [p for p, (d, w) in rm.ports.items() if d == 'input' and w == 1 and re.search(r'clk|clock', p, re.I)]
+    rst = a.rtl_reset or next((p for p, (d, w) in rm.ports.items() if d == 'input' and w == 1 and
+                               re.search(r'rst|reset', p, re.I)), None)
+    rst_low = a.rtl_reset_low if a.rtl_reset_low is not None else bool(rst and re.search(r'(_n|_ni|n)$', rst))
+    gen.rtl_rows, gen.rtl_info = [], {'dut': a.rtl_top, 'instance': rm.dut_path, 'clock': clk, 'reset': rst,
+                                      'reset_active_low': rst_low, 'notes': rm.notes}
+    jobs = []
+    for m in gen.mods_cg:
+        if not m.hit_order: continue
+        mp = rm.map_cg(m)
+        mapped = {p for p, (src, _) in mp.items() if src}
+        deps = cover_deps(m)
+        keep = [c for c in m.hit_order if deps.get(c) and deps[c] <= mapped]
+        m.rtl_map = {p: {'source': (list(src) if src else None), 'why': why} for p, (src, why) in mp.items()}
+        for c in m.hit_order:
+            if c not in keep:
+                gen.rtl_rows.append({'covergroup': m.name, 'cover': c, 'status': 'unmapped',
+                                     'needs': sorted((deps.get(c) or set()) - mapped)})
+        if not keep: continue
+        probes, lines = {}, [f'module fv_rtl_top (input logic clk);',
+                             "  logic [1:0] fv_rcnt = 2'd0;      // reset held for the first cycles",
+                             "  always_ff @(posedge clk) if (fv_rcnt != 2'd3) fv_rcnt <= fv_rcnt + 2'd1;",
+                             "  wire fv_rst = (fv_rcnt != 2'd3);"]
+        conns = []
+        for p, (d, w) in rm.ports.items():
+            if d == 'input':
+                if p in clk: conns.append(f'.{p}(clk)')
+                elif p == rst: conns.append(f".{p}({'!fv_rst' if rst_low else 'fv_rst'})")
+                else:
+                    lines.append(f'  (* anyseq *) logic [{w - 1}:0] in_{p};')
+                    conns.append(f'.{p}(in_{p})')
+            else:
+                lines.append(f'  wire [{w - 1}:0] out_{p};')
+                conns.append(f'.{p}(out_{p})')
+        lines.append(f'  {a.rtl_top} u_dut (' + ', '.join(conns) + ');')
+        cg_conns = ['.clk(clk)', '.reset(fv_rst)', ".sample(!fv_rst)"]
+        for port in m.port_order:
+            if port in ('clk', 'reset', 'sample'): continue
+            src = mp[port][0]
+            pw = decl_width(m.ports[port][1])
+            if src is None:
+                lines.append(f'  (* anyseq *) logic [{pw - 1}:0] f_{port};')
+                cg_conns.append(f'.{port}(f_{port})'); continue
+            if src[0] == 'port':
+                d, w = rm.ports[src[1]]
+                val = f"{'in' if d == 'input' else 'out'}_{src[1]}"
+            else:
+                _, path, lo, wd = src
+                pn = probes.setdefault(path, f'pr_{len(probes)}')
+                if f'  wire [{rm.nets[path] - 1}:0] {pn};' not in lines:
+                    lines.append(f'  wire [{rm.nets[path] - 1}:0] {pn};   // u_dut.{path} (connected after flatten)')
+                val = f'{pn}[{lo + wd - 1}:{lo}]'
+            lines.append(f'  wire [{pw - 1}:0] v_{port} = {val};')
+            cg_conns.append(f'.{port}(v_{port})')
+        post = '; '.join(f'connect -nounset -set {pn} u_dut.{path}' for path, pn in probes.items())
+        pre = f'plugin -i slang; read_slang --single-unit {rm.slang_args()} --top {a.rtl_top}; '
+        for lo, hi in [(i, min(i + a.cover_chunk, len(keep))) for i in range(0, len(keep), a.cover_chunk)]:
+            names = keep[lo:hi]
+            top = ident('rtl_' + m.name + (f'__{lo}' if len(keep) > a.cover_chunk else ''))
+            src = '\n'.join(lines + [f'  {m.name} u_cg (' + ', '.join(cg_conns) + ');', 'endmodule']).replace(
+                'module fv_rtl_top', f'module {top}')
+            jobs.append(Job(rd, top, src, [only_covers(m, names)], a.rtl_depth, ' -DFV_NO_ILLEGAL_BINS', m, names,
+                            pre=pre, post=post))
+    for j in jobs: j.write(gen)
+    res = run_jobs(gen, jobs, a.jobs, on_done=lambda job, hits: {c: st for c, (_, st) in hits.items()})
+    for job, status, rch, unr, err, steps in res:
+        for c in job.names:
+            row = {'covergroup': job.m.name, 'cover': c}
+            if c in rch: row.update(status='reached', step=(steps or {}).get(c))
+            elif status in ('PASS', 'FAIL') and c in unr: row['status'] = 'unreached'
+            else: row.update(status='error' if status == 'ERROR' else 'timeout', error=err)
+            gen.rtl_rows.append(row)
+    gen.rtl_info['maps'] = {m.name: m.rtl_map for m in gen.mods_cg if getattr(m, 'rtl_map', None)}
+    gen.rtl_info['depth'] = a.rtl_depth
+    return gen.rtl_rows
+
+
 def run_jobs(gen, jobs, n_jobs=8, on_done=None):
     """run the jobs (yosys + yosys-smtbmc, what their .sby does); (job, status, reached, unreached,
     err, extra) per job. on_done(job, {cover: (vcd, step)}) runs before the job directory is removed
@@ -3547,14 +3789,16 @@ def run_jobs(gen, jobs, n_jobs=8, on_done=None):
         reached, unreached, pending, traces = {}, set(), [], {}
         for line in log.splitlines():
             mm = re.search(r'Reached cover statement in step (\d+) at \S+: (\S+)', line)
-            if mm: reached[mm.group(2)] = int(mm.group(1)); pending.append(mm.group(2)); continue
+            if mm:      # flattened designs name covers by instance path (u_cg.cov_x)
+                c = mm.group(2).split('.')[-1]
+                reached[c] = int(mm.group(1)); pending.append(c); continue
             mm = re.search(r'Writing trace to VCD file: (\S+)', line)
             if mm:
                 for c in pending: traces[c] = os.path.join(sd, mm.group(1))
                 pending = []
                 continue
             mm = re.search(r'Unreached cover statement at \S+: (\S+)', line)
-            if mm: unreached.add(mm.group(1))
+            if mm: unreached.add(mm.group(1).split('.')[-1])
         rset = set(reached)
         if job.names is not None:
             keep = set(job.names)
@@ -3593,7 +3837,8 @@ def summarize(gen):
                        'asserts': sum(len(e.get('asserts', [])) for e in bins)},
             'entries': gen.report, 'smoke': getattr(gen, 'smoke_results', None),
             'replay': getattr(gen, 'replay_rows', None),
-            'witness_skipped': getattr(gen, 'witness_skipped', None)}
+            'witness_skipped': getattr(gen, 'witness_skipped', None),
+            'rtl': getattr(gen, 'rtl_rows', None), 'rtl_info': getattr(gen, 'rtl_info', None)}
 
 
 def report_md(rep):
@@ -3612,6 +3857,28 @@ def report_md(rep):
                    f"unsatisfiable constraint sets: {s['unsat']}")
         out.append(f"- covers reached: {s['reached']}/{s['covers']}\n")
         for line in s.get('problems', [])[:200]: out.append(f'- {line}')
+        out.append('')
+    if rep.get('rtl') is not None:
+        info = rep['rtl_info']
+        out.append('## Covergroups on the RTL\n')
+        out.append(f"DUT `{info['dut']}` (instance `{info['instance']}`), clock {info['clock']}, reset `{info['reset']}` "
+                   f"(active {'low' if info['reset_active_low'] else 'high'}, held 3 cycles), explored {info['depth']} cycles "
+                   'from reset. DUT inputs are free (no driver model yet: a reached bin may use input sequences the '
+                   'protocol forbids). Covergroups are sampled every cycle, so a bin is reached when the design ever '
+                   'holds that value, whenever the testbench would sample it. **reached**: the design gets there; '
+                   '**unreached**: not within the bound; **unmapped**: an input has no RTL counterpart.\n')
+        for n in info.get('notes') or []: out.append(f'- note: {n}')
+        for mname, mp in (info.get('maps') or {}).items():
+            out.append(f'- `{mname}` inputs:')
+            for port, x in mp.items():
+                out.append(f"  - `{port}`: {'**' + str(x['source'][1]) + '**' if x['source'] else 'free'} ({x['why']})")
+        cnt = {}
+        for r in rep['rtl']: cnt[r['status']] = cnt.get(r['status'], 0) + 1
+        out.append('- ' + ', '.join(f'{k}: {v}' for k, v in sorted(cnt.items())) + '\n')
+        for r in rep['rtl'][:3000]:
+            extra = f" (needs {', '.join(r['needs'])})" if r.get('needs') else (f" ({r['error']})" if r.get('error') else
+                     (f" at cycle {r['step']}" if r.get('step') is not None else ''))
+            out.append(f"- **{r['status']}** `{r['covergroup']}.{r['cover']}`{extra}")
         out.append('')
     if rep.get('replay') is not None:
         rows = rep['replay']
@@ -3702,6 +3969,14 @@ def main():
     ap.add_argument('--witness', action='store_true', help='reach every bin from the randomize() model of the class '
                     'whose fields the covergroup samples, and write fv_replay.sv: override classes that make a '
                     'simulation hit a chosen bin with any seed')
+    ap.add_argument('--rtl', action='append', help='slang argument file (-f) of the DUT RTL: run the covergroups '
+                    'on the design (repeatable)')
+    ap.add_argument('--rtl-top', help='DUT module (its instance in the testbench top gives the connections)')
+    ap.add_argument('--rtl-define', action='append', help='define for reading the RTL (repeatable)')
+    ap.add_argument('--rtl-depth', type=int, default=40, help='cycles explored from reset on the RTL')
+    ap.add_argument('--rtl-reset', help='DUT reset port (default: the input named like rst/reset)')
+    ap.add_argument('--rtl-reset-low', type=lambda v: v.lower() in ('1', 'true', 'yes'), default=None,
+                    help='reset is active low (default: name ends in n / ni)')
     ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')
     a = ap.parse_args()
     d = json.load(open(a.json))
@@ -3746,7 +4021,10 @@ def main():
                              'timeouts': tmo, 'unsat': unsat, 'covers': total, 'reached': reached, 'problems': probs}
     if a.witness:
         witness(gen, a.out)
-    if a.run or a.witness:
+    if a.rtl:
+        if not a.rtl_top: sys.exit('--rtl needs --rtl-top')
+        rtl_flow(gen, a.out)
+    if a.run or a.witness or a.rtl:
         rep = summarize(gen)
         with open(os.path.join(a.out, 'report.json'), 'w') as f:
             json.dump(rep, f, indent=1, default=lambda o: sorted(o) if isinstance(o, set) else str(o))
@@ -3758,6 +4036,10 @@ def main():
         s = rep['smoke']
         print(f"smoke: {s['modules']} modules, {s['errors']} errors, {s['timeouts']} timeouts, {s['unsat']} unsat, "
               f"covers {s['reached']}/{s['covers']}")
+    if rep.get('rtl') is not None:
+        cnt = {}
+        for r in rep['rtl']: cnt[r['status']] = cnt.get(r['status'], 0) + 1
+        print('rtl: ' + ', '.join(f'{k} {v}' for k, v in sorted(cnt.items())) + f" (depth {rep['rtl_info']['depth']})")
     if rep.get('replay') is not None:
         rows = rep['replay']
         cnt = {}

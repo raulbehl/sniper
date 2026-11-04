@@ -197,6 +197,21 @@ def test_fv_extraction():
                      ('constraint_mode', 'it', None, "1'b1", 51), ('rand_mode', 'it', None, "1'b0", 53)]
 
 
+def test_rtl_mapping_extraction():
+    """What fvgen --rtl reads: the register model's field positions and HDL paths (any file), and the
+    testbench top's continuous assigns."""
+    d = run_probe('rtl_tb.sv', 'rf_tb', [os.path.join(HERE, 'rtl_dut.sv')])
+    assert d['meta']['errors'] == 0, d['meta']['error_list']
+    ral = d['ral']
+    assert ral['regs'] == {'rf_pkg::rf_reg_cfg': {'mode': {'lsb': 0, 'size': 2, 'access': 'RW'}}}
+    blk = ral['blocks']['rf_pkg::rf_reg_block']
+    assert blk['roots'] == [{'path': 'rf_tb.dut', 'kind': 'RTL'}]
+    assert blk['regs'] == {'cfg': {'class': 'rf_pkg::rf_reg_cfg',
+                                   'slices': [{'path': 'cfg_q', 'offset': 0, 'size': 2, 'kind': 'RTL'}]}}
+    tb = next(h for h in d['hierarchy'] if h['name'] == 'rf_tb')
+    assert [(a['lhs'], a['rhs']) for a in tb['assigns']] == [('rif.level', 'lvl'), ('rif.busy', 'dut.busy')]
+
+
 def test_invalid_code():
     """Code slang cannot bind is reported in facts.invalid and counted, not analysed."""
     d = run_probe('probe_invalid.sv', 'invalid_top')
@@ -212,5 +227,6 @@ if __name__ == '__main__':
     test_probe()
     test_corpus_regressions()
     test_fv_extraction()
+    test_rtl_mapping_extraction()
     test_invalid_code()
     print('probe tests passed')
