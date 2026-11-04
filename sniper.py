@@ -1042,6 +1042,11 @@ class Extractor:
                 ent['coverpoints'].append(self.coverpoint_entry(m))
             elif mk == 'CoverCross':
                 ent['crosses'].append(self.cross_entry(m))
+        if not ent['sample_args'] and body is not None and 'with function sample' in (ent['sample_event'] or ''):
+            # `with function sample(...)`: the arguments belong to the body's sample() method
+            sm = body.find('sample')
+            for m in (getattr(sm, 'arguments', None) or []):
+                ent['sample_args'].append({'name': m.name, 'type': str(m.type), 'ti': type_info(m.type)})
         if cg.syntax is not None:
             for opt in re.findall(r'(?:type_)?option\.\w+\s*=\s*[^;]+;', str(cg.syntax)):
                 if opt not in ent['options']: ent['options'].append(' '.join(opt.split()))

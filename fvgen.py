@@ -812,7 +812,7 @@ class Module:
                              for i, (t, c) in enumerate(items))
         hdr = f'module {self.name}'
         if self.params:
-            hdr += ' #(\n' + lines([(f'parameter bit {p} = {d}', c) for p, d, c in self.params]) + '\n)'
+            hdr += ' #(\n' + lines([(f'parameter {(x[3:] or ("bit",))[0]} {x[0]} = {x[1]}', x[2]) for x in self.params]) + '\n)'
         ports = [(f'{self.ports[nm][0]} {self.ports[nm][1]}', self.ports[nm][2]) for nm in self.port_order]
         out.append(hdr + ' (\n' + lines(ports) + '\n);')
         out.append('  `include "prim_assert.sv"')
@@ -1103,6 +1103,7 @@ class Gen:
                      + (f"; randomize() at {site['where']}: {site['src']}" if site else ''))
         notes = []
         root = self.build_obj(mod, cls, '', 'rand', cls['name'], 0, notes)
+        mod.cls, mod.site, mod.root = cls, site, root
         rand_filter = site.get('args') if site else None
         cm_mode, rand_mode = self.modes(chain, site)
         res = ObjResolver(self, mod, root, root.chain)
@@ -1348,7 +1349,7 @@ class Gen:
         cache = self.__dict__.setdefault('sat_cache', {})
         if key in cache: return cache[key]
         ports = [f"  input {mod.ports[nm][1]}," for nm in mod.port_order if nm not in ('clk', 'reset', 'en')]
-        params = ''.join(f'  localparam bit {p} = {d};\n' for p, d, _ in mod.params)
+        params = ''.join(f'  localparam {(x[3:] or ("bit",))[0]} {x[0]} = {x[1]};\n' for x in mod.params)
         src = ('module fv_sat_chk (\n' + '\n'.join(ports) + '\n  output ok\n);\n' + params + '\n'.join(mod.temps) +
                '\n  assign ok = ' + ' && '.join(f"({a['cond']})" for a in atoms) + ';\nendmodule\n')
         with tempfile.TemporaryDirectory(prefix='fvsat_') as d:
@@ -1736,6 +1737,52 @@ class Gen:
             if cg.get('uninstantiated'): continue
             if want and not want.search(cg.get('owner') or cg['path']): continue
             CoverGen(self, cg).build()
+        if self.a.witness: self.plan_witness()
+
+    def plan_witness(self):
+        """for each covergroup whose sampled values are fields of a randomized class: that class's
+        randomize() model (fv_r_) drives the covergroup, sampled the cycle after randomize. A port is
+        `pin` (a rand field: a replay can force it), `state` (a non-rand field the constraints read:
+        free, held between calls) or `free` (anything else: monitor data, signals, other objects)."""
+        def class_mod(c):
+            for cm, rm in self.mods_c:
+                if getattr(cm, 'site', 1) is None and rm is not None and cm.cls['path'] == c['path']:
+                    return cm, rm
+            return None
+        for m in self.mods_cg:
+            m.wit = None
+            srcs = getattr(m.res, 'src', {})
+            tally = {}
+            for port, (c, path) in srcs.items(): tally.setdefault(c['path'], [c, 0])[1] += 1
+            for c, _ in sorted(tally.values(), key=lambda x: -x[1]):
+                if class_mod(c) is None and any(p['rand'] in ('Rand', 'RandC')
+                                                for x in self.chain(c) for p in x['properties']):
+                    self.emit_constraint_module(c)
+                pair = class_mod(c)
+                if pair is None: continue
+                cm, rm = pair
+                outs = {nm for nm in rm.port_order if rm.ports[nm][0] == 'output'}
+                ins = {nm for nm in rm.port_order if rm.ports[nm][0] == 'input'} - {'clk', 'reset', 'randomize'}
+                props = {p['name']: p for x in reversed(self.chain(c)) for p in x['properties']}
+                ports = {}
+                for port in m.port_order:
+                    if port in ('clk', 'reset', 'sample'): continue
+                    sc = srcs.get(port)
+                    if sc is None or sc[0]['path'] != c['path']:
+                        ports[port] = ('free', None, 'not a field of ' + c['name']); continue
+                    leaf = ident('__'.join(sc[1]))
+                    vis = (props.get(sc[1][0]) or {}).get('visibility', '')
+                    if leaf in outs and 'local' not in str(vis).lower():
+                        ports[port] = ('pin', leaf, '.'.join(sc[1]))
+                    elif leaf in outs:
+                        ports[port] = ('free', leaf, f"{'.'.join(sc[1])} is local to {c['name']}: a derived class cannot constrain it")
+                    elif leaf in ins:
+                        ports[port] = ('state', leaf, f"{'.'.join(sc[1])} is not rand (testbench state)")
+                    else:
+                        ports[port] = ('free', None, f"{'.'.join(sc[1])} is not rand and no constraint reads it")
+                if any(k == 'pin' for k, _, _ in ports.values()):
+                    m.wit = {'cls': c, 'cm': cm, 'rm': rm, 'ports': ports}
+                break
 
     def emit_constraint_module(self, cls, site=None):
         try:
@@ -1895,6 +1942,10 @@ class CoverGen:
             mod.port('output', f'logic [{len(self.hits) - 1}:0] fv_hits', 'fv_hits', 'bin hits (--expose)')
             mod.body.append('  assign fv_hits = {' + ', '.join(f'({w})' for _, w in reversed(self.hits)) + '};')
         mod.hit_order = [n for n, _ in self.hits]
+        mod.hit_wires = dict(self.hits)
+        if self.hits:
+            mod.params += [('FV_COVER_LO', '0', 'first cover enabled (formal runs split covergroups)', 'int'),
+                           ('FV_COVER_HI', str(len(self.hits)), 'covers enabled: index < FV_COVER_HI', 'int')]
         self.gen.mods_cg.append(mod)
         mod.entries = self.entries
         mod.sample_event = cg.get('sample_event')
@@ -1917,7 +1968,7 @@ class CoverGen:
             mod.body.append(f"  always_ff @({self.edge} clk) if (!reset && {w} && {cnt} != {lit(at_least, cw, False)}) "
                             f"{cnt} <= {cnt} + 1'b1;")
             w = f'({w} && {cnt} == {lit(at_least - 1, cw, False)})'
-        mod.body.append(self.stmt('COVER', cn, w))
+        mod.body.append(self.stmt('COVER', cn, w, len(self.hits)))
         ent.setdefault('covers', []).append(cn)
         self.hits.append((cn, w))
         self.n_cover += 1
@@ -1930,13 +1981,15 @@ class CoverGen:
         ent.setdefault('asserts', []).append(an)
         self.n_assert += 1
 
-    def stmt(self, kind, name, prop):
+    def stmt(self, kind, name, prop, idx=None):
         # same reset gating as prim_assert's COVER/ASSERT, but the label is on the statement itself
-        # so SymbiYosys reports each cover by its bin name
+        # so SymbiYosys reports each cover by its bin name. Cover idx is on only inside
+        # [FV_COVER_LO, FV_COVER_HI): formal runs split large covergroups into parallel jobs
         if kind == 'ASSERT' and self.edge == 'posedge':
             return f'  `ASSERT({name}, {prop}, clk, reset)'
         k = {'COVER': 'cover', 'ASSERT': 'assert'}[kind]
-        return f"  always_ff @({self.edge} clk) if (reset === 1'b0) {name}: {k} ({prop});"
+        sel = f' && FV_COVER_LO <= {idx} && {idx} < FV_COVER_HI' if idx is not None else ''
+        return f"  always_ff @({self.edge} clk) if (reset === 1'b0{sel}) {name}: {k} ({prop});"
 
     # ---- coverpoints
     def coverpoint(self, cp):
@@ -2667,14 +2720,18 @@ class CgResolver:
         self.gen, self.mod, self.cg = gen, mod, cg
         self.inputs = {}      # port -> (w, signed, comment)
         self.origin = {}      # port -> source expression (for binding)
+        self.src = {}         # port -> (class, [field, ...]): the value is that field of a class object
+        owner = cg.get('owner')
+        self.owner_cls = gen.cls(owner, cg.get('path')) if owner else None
 
-    def port(self, name, n, origin):
+    def port(self, name, n, origin, src=None):
         nm = ident(name)
         if n.get('w') is None:
             raise Unsupported(f'{origin}: not an integral value')
         if nm not in self.inputs:
             self.inputs[nm] = (n['w'], bool(n.get('signed')), origin)
             self.origin[nm] = origin
+            if src and src[0] is not None: self.src[nm] = src
             self.mod.names.used.add(nm)
         return S(nm, n['w'], bool(n.get('signed')), None, not n.get('signed'))
 
@@ -2685,16 +2742,24 @@ class CgResolver:
             src = n.get('src') or sym.get('path', nm)
             return self.port(src.replace('.', '__'), n, src)
         if n.get('w') is None:      # a handle or aggregate: members become ports
-            return ORef(Obj(None, nm + '__', 'state', nm))
+            o = Obj(None, nm + '__', 'state', nm)
+            o.wit = (self.gen.cls(n.get('ty', ''), self.cg.get('path')), [])     # members: fields of that class
+            return ORef(o)
+        if sk == 'ClassProperty' and self.owner_cls is not None:
+            return self.port(nm, n, nm, (self.owner_cls, [nm]))
         if sk in ('ClassProperty', 'FormalArgument', 'Variable', 'Net', 'Parameter'):
             return self.port(nm, n, nm)
         raise Unsupported(f'reference to {sk} {nm} in a coverpoint')
 
     def member(self, base, n, tx):
         nm = base.obj.prefix + n['member']['sym']
+        w = getattr(base.obj, 'wit', None)
+        src = (w[0], w[1] + [n['member']['sym']]) if w else None
         if n.get('w') is None:
-            return ORef(Obj(None, nm + '__', 'state', nm))
-        return self.port(nm, n, nm.replace('__', '.'))
+            o = Obj(None, nm + '__', 'state', nm)
+            o.wit = src
+            return ORef(o)
+        return self.port(nm, n, nm.replace('__', '.'), src)
 
 
 # ======================================================================== output
@@ -2732,49 +2797,72 @@ def write_outputs(gen, out):
     return rep
 
 
+def cover_depth(m):
+    """bound for a covergroup's formal runs: transition monitors and at_least counters need steps"""
+    depth = 2 + max([len(re.findall(r'\bc_|\bg_|\bn_', l)) for l in m.body] + [0])
+    return min(max(4, depth), 24)
+
+
+def chunks(m, size):
+    """cover index ranges of a covergroup module, at most `size` covers each"""
+    n = len(m.hit_order)
+    if n == 0: return [(0, 0)]
+    return [(lo, min(lo + size, n)) for lo in range(0, n, size)]
+
+
 def smoke(gen, out):
-    """one formal top per generated module, every input free (anyseq): cover mode shows whether the
-    constraints are satisfiable and whether every bin can be hit"""
+    """one formal top per generated module (large covergroups: per chunk of covers), every input
+    free (anyseq): cover mode shows whether the constraints are satisfiable and whether every bin
+    can be hit"""
     sd = os.path.join(out, 'smoke')
     os.makedirs(sd, exist_ok=True)
-    jobs = []
+    gen.smokes = []
     for cm, rm in gen.mods_c:
         top = ident('smoke_' + cm.name)
-        lines = [f'module {top} (input logic clk);', '  `include "prim_assert.sv"']
+        lines = [f'module {top} (input logic clk);']
         conns = ['.clk(clk)', ".reset(1'b0)", ".en(1'b1)"]
         for nm in cm.port_order:
             if nm in ('clk', 'reset', 'en'): continue
-            decl = cm.ports[nm][1]
-            lines.append(f'  (* anyseq *) {decl};')
+            lines.append(f'  (* anyseq *) {cm.ports[nm][1]};')
             conns.append(f'.{nm}({nm})')
         lines.append(f'  {cm.name} u_dut (' + ', '.join(conns) + ');')
         lines.append("  always_ff @(posedge clk) sat: cover (1'b1);   // the constraints have a solution")
         lines.append('endmodule')
-        jobs.append((top, '\n'.join(lines), 'fv_constraints.sv', 2, cm))
+        gen.smokes.append(Job(sd, top, '\n'.join(lines), [cm], 2, ' -DFV_LIVENESS_COVERS', cm))
     for m in gen.mods_cg:
-        top = ident('smoke_' + m.name)
-        lines = [f'module {top} (input logic clk);']
-        conns = ['.clk(clk)', ".reset(1'b0)"]
-        for nm in m.port_order:
-            if nm in ('clk', 'reset'): continue
-            decl = m.ports[nm][1]
-            lines.append(f'  (* anyseq *) {decl};')
-            conns.append(f'.{nm}({nm})')
-        lines.append(f'  {m.name} u_dut (' + ', '.join(conns) + ');')
-        lines.append('endmodule')
-        depth = 2 + max([len(re.findall(r'\bc_|\bg_', l)) for l in m.body] + [0])
-        depth = min(max(4, depth), 24)
-        jobs.append((top, '\n'.join(lines), 'fv_covers.sv', depth, m))
-    gen.smokes = []
-    for top, src, lib, depth, m in jobs:
-        with open(os.path.join(sd, top + '.sv'), 'w') as f: f.write(src + '\n')
-        defs = ' -DFV_NO_ILLEGAL_BINS' if lib == 'fv_covers.sv' else ' -DFV_LIVENESS_COVERS'
-        vcd = '' if gen.a.keep else 'vcd off\n'
-        sby = (f'[options]\nmode cover\ndepth {depth}\n{vcd}\n[engines]\nsmtbmc {gen.a.solver}\n\n[script]\n'
-               f'read_verilog -sv -formal -DFORMAL{defs} {lib} {top}.sv\nprep -top {top}\n\n[files]\n'
-               f'../{lib}\n{top}.sv\n../prim_assert.sv\n../prim_assert_yosys_macros.svh\n')
-        with open(os.path.join(sd, top + '.sby'), 'w') as f: f.write(sby)
-        gen.smokes.append((top, m))
+        for lo, hi in chunks(m, gen.a.cover_chunk):
+            top = ident('smoke_' + m.name + (f'__{lo}' if len(m.hit_order) > gen.a.cover_chunk else ''))
+            lines = [f'module {top} (input logic clk);']
+            conns = ['.clk(clk)', ".reset(1'b0)"]
+            for nm in m.port_order:
+                if nm in ('clk', 'reset'): continue
+                lines.append(f'  (* anyseq *) {m.ports[nm][1]};')
+                conns.append(f'.{nm}({nm})')
+            sel = f' #(.FV_COVER_LO({lo}), .FV_COVER_HI({hi}))' if m.hit_order else ''
+            lines.append(f'  {m.name}{sel} u_dut (' + ', '.join(conns) + ');')
+            lines.append('endmodule')
+            gen.smokes.append(Job(sd, top, '\n'.join(lines), [m], cover_depth(m), ' -DFV_NO_ILLEGAL_BINS', m,
+                                  m.hit_order[lo:hi]))
+    for j in gen.smokes: j.write(gen)
+
+
+class Job:
+    """one SymbiYosys cover run: a top, the generated modules it needs (written next to it, so a job
+    does not parse every module), and the covers it is responsible for"""
+
+    def __init__(self, d, top, src, mods, depth, defs, m, names=None, traces=False):
+        self.d, self.top, self.src, self.mods, self.depth, self.defs = d, top, src, mods, depth, defs
+        self.m, self.names, self.traces = m, names, traces
+
+    def write(self, gen):
+        with open(os.path.join(self.d, self.top + '.sv'), 'w') as f: f.write(self.src + '\n')
+        with open(os.path.join(self.d, self.top + '_lib.sv'), 'w') as f:
+            f.write(''.join(x.emit() + '\n' for x in self.mods))
+        vcd = '' if (gen.a.keep or self.traces) else 'vcd off\n'
+        sby = (f'[options]\nmode cover\ndepth {self.depth}\n{vcd}\n[engines]\nsmtbmc {gen.a.solver}\n\n[script]\n'
+               f'read_verilog -sv -formal -DFORMAL{self.defs} {self.top}_lib.sv {self.top}.sv\nprep -top {self.top}\n\n'
+               f'[files]\n{self.top}_lib.sv\n{self.top}.sv\n../prim_assert.sv\n../prim_assert_yosys_macros.svh\n')
+        with open(os.path.join(self.d, self.top + '.sby'), 'w') as f: f.write(sby)
 
 
 def guard_text(cond):
@@ -2795,11 +2883,278 @@ def qualify(text, inst):
                   else f'{inst}.{m.group(1)}', re.sub(r"\d+'s?[hdbo][0-9a-fA-F_xz?]+", lambda m: m.group(0), text))
 
 
-def run_smoke(gen, out, jobs=8):
-    sd = os.path.join(out, 'smoke')
+def renamed(decl, old, new):
+    """'logic signed [7:0] a' -> 'logic signed [7:0] r_a'"""
+    return re.sub(r'\b%s$' % re.escape(old), new, decl)
 
-    def one(item):
-        top, m = item
+
+def decl_width(decl):
+    m = re.search(r'\[(\d+):0\]', decl)
+    return int(m.group(1)) + 1 if m else 1
+
+
+def witness(gen, out):
+    """reach every bin of a covergroup from the randomize() model of the class it samples
+    (plan_witness): the covergroup is sampled the cycle after each randomize(), with that call's
+    field values. Each reached bin's trace gives the field values of every randomize() up to the hit."""
+    wd = os.path.join(out, 'witness')
+    os.makedirs(wd, exist_ok=True)
+    jobs = []
+    for m in gen.mods_cg:
+        w = getattr(m, 'wit', None)
+        if not w or not m.hit_order: continue
+        rm, cm = w['rm'], w['cm']
+        for lo, hi in chunks(m, gen.a.cover_chunk):
+            top = ident('wit_' + m.name + (f'__{lo}' if len(m.hit_order) > gen.a.cover_chunk else ''))
+            lines = [f'module {top} (input logic clk);',
+                     '  (* anyseq *) logic randomize;     // randomize() is called this cycle',
+                     "  logic sample = 1'b0;               // the covergroup samples the new values next cycle",
+                     '  always_ff @(posedge clk) sample <= randomize;']
+            rconns = ['.clk(clk)', ".reset(1'b0)", '.randomize(randomize)']
+            for nm in rm.port_order:
+                if nm in ('clk', 'reset', 'randomize'): continue
+                dirn, decl, _ = rm.ports[nm]
+                if dirn == 'output':
+                    lines.append(f'  {renamed(decl, nm, "r_" + nm)};')
+                    rconns.append(f'.{nm}(r_{nm})')
+                else:   # testbench state: any value at the call, held until the covergroup samples it
+                    lines += [f'  (* anyseq *) {renamed(decl, nm, "s_" + nm)};', f'  {renamed(decl, nm, "q_" + nm)};',
+                              f"  initial q_{nm} = '0;", f'  always_ff @(posedge clk) if (randomize) q_{nm} <= s_{nm};']
+                    rconns.append(f'.{nm}(s_{nm})')
+            lines.append(f'  {rm.name} u_r (' + ', '.join(rconns) + ');')
+            conns = ['.clk(clk)', ".reset(1'b0)", '.sample(sample)']
+            for port in m.port_order:
+                if port in ('clk', 'reset', 'sample'): continue
+                kind, leaf, _ = w['ports'][port]
+                if kind == 'pin': conns.append(f'.{port}(r_{leaf})')
+                elif kind == 'state': conns.append(f'.{port}(q_{leaf})')
+                else:
+                    lines.append(f'  (* anyseq *) {renamed(m.ports[port][1], port, "f_" + port)};')
+                    conns.append(f'.{port}(f_{port})')
+            lines.append(f'  {m.name} #(.FV_COVER_LO({lo}), .FV_COVER_HI({hi})) u_cg (' + ', '.join(conns) + ');')
+            lines.append('endmodule')
+            jobs.append(Job(wd, top, '\n'.join(lines), [cm, rm, m], min(cover_depth(m) + 2, 30),
+                            ' -DFV_NO_ILLEGAL_BINS', m, m.hit_order[lo:hi], traces=True))
+    for j in jobs: j.write(gen)
+    res = run_jobs(gen, jobs, gen.a.jobs, on_done=parse_witness)
+    gen.witness_results = {}
+    for job, status, rch, unr, err, extra in res:
+        r = gen.witness_results.setdefault(job.m.name, {'reached': {}, 'unreached': set(), 'problems': []})
+        r['reached'].update(extra or {})
+        r['unreached'] |= unr
+        if status in ('ERROR', 'TIMEOUT'): r['problems'].append(f'{job.top}: {status}: {err}')
+    return write_replay(gen, out)
+
+
+def read_vcd(path):
+    """{step: {top-level signal: int}} of a yosys-smtbmc trace (one step per 10 time units)"""
+    ids, depth, steps, cur, t = {}, 0, {}, {}, None
+    with open(path) as f:
+        for line in f:
+            tok = line.split()
+            if not tok: continue
+            if tok[0] == '$scope': depth += 1
+            elif tok[0] == '$upscope': depth -= 1
+            elif tok[0] == '$var' and depth == 1: ids.setdefault(tok[3], []).append(tok[4])
+            elif tok[0].startswith('#'):
+                if t is not None and t % 10 == 0: steps[t // 10] = dict(cur)
+                t = int(tok[0][1:])
+            elif tok[0][0] in 'bB' and len(tok) == 2:
+                for nm in ids.get(tok[1], []):
+                    try: cur[nm] = int(tok[0][1:], 2)
+                    except ValueError: pass
+            elif tok[0][0] in '01xz' and len(tok[0]) > 1:
+                for nm in ids.get(tok[0][1:], []):
+                    if tok[0][0] in '01': cur[nm] = int(tok[0][0])
+    if t is not None and t % 10 == 0: steps[t // 10] = dict(cur)
+    return steps
+
+
+def parse_witness(job, jobdir, summary):
+    """cover -> {'step', 'samples': [{port: value}]}: the covergroup's inputs at every sample
+    (= every randomize() call) before the cover fired"""
+    hits, trace = {}, None
+    for body in summary:
+        mm = re.match(r'\s*cover trace: (\S+)', body)
+        if mm:
+            # the PASS/FAIL file names traces relative to the job directory, the log relative to the
+            # .sby directory, sometimes as the .yw witness next to the .vcd
+            t = re.sub(r'\.yw$', '.vcd', mm.group(1))
+            trace = next((x for x in (os.path.join(jobdir, t), os.path.join(job.d, t)) if os.path.exists(x)), None)
+            continue
+        mm = re.match(r'\s+reached cover statement (\S+) at .* step (\d+)', body)
+        if mm and trace: hits[mm.group(1).split('.')[-1]] = (trace, int(mm.group(2)))
+    w = job.m.wit
+    cache, out = {}, {}
+    for cover, (tr, step) in hits.items():
+        if job.names is not None and cover not in job.names: continue
+        if tr not in cache: cache[tr] = read_vcd(tr)
+        vals = cache[tr]
+        samples = []
+        for st in sorted(vals):
+            if st >= step or not vals[st].get('sample'): continue
+            row = {}
+            for port, (kind, leaf, _) in w['ports'].items():
+                sig = {'pin': 'r_', 'state': 'q_'}.get(kind, 'f_') + (leaf if kind in ('pin', 'state') else port)
+                if sig in vals[st]: row[port] = vals[st][sig]
+            samples.append(row)
+        out[cover] = {'step': step, 'samples': samples}
+    return out
+
+
+def cover_deps(m):
+    """cover -> covergroup input ports its hit depends on (through cp_ wires, transition monitors
+    and at_least counters)"""
+    deps = {}
+    def idents(t): return set(re.findall(r"(?<!['\w])([A-Za-z_]\w*)", t))
+    block, targets = None, None
+    for line in m.temps + m.body:
+        mm = re.match(r'\s*wire\b[^=]*?\b(\w+)\s*=\s*(.*);', line)
+        if mm: deps.setdefault(mm.group(1), set()).update(idents(mm.group(2))); continue
+        if re.match(r'\s*always_ff\b', line) and line.rstrip().endswith('begin'):
+            block, targets = set(), set(); continue
+        if block is not None:
+            block |= idents(line)
+            targets |= set(re.findall(r'(\w+)\s*<=', line))
+            if line.strip() == 'end' and not line.startswith('    '):
+                for x in targets: deps.setdefault(x, set()).update(block)
+                block = None
+            continue
+        mm = re.match(r'\s*always_ff @\(\w+ clk\) if \((.*)\) (\w+) <= (.*);', line)
+        if mm: deps.setdefault(mm.group(2), set()).update(idents(mm.group(1)) | idents(mm.group(3)))
+    ports = set(m.port_order) - {'clk', 'reset', 'sample'}
+    out = {}
+    for cn, w in m.hit_wires.items():
+        seen, todo = set(), list(idents(w))
+        while todo:
+            x = todo.pop()
+            if x in seen: continue
+            seen.add(x)
+            todo += list(deps.get(x, ()))
+        out[cn] = seen & ports
+    return out
+
+
+def write_replay(gen, out):
+    """fv_replay.sv: per randomized class, `<class>__fv_replay extends <class>`. With
+    +FV_HIT=<covergroup module>.<cover> its first randomize() calls take the witness values of the
+    fields that bin depends on (other fields stay random); later calls are unconstrained."""
+    by_cls, rows = {}, []
+    for m in gen.mods_cg:
+        w = getattr(m, 'wit', None)
+        r = getattr(gen, 'witness_results', {}).get(m.name)
+        if not w or r is None: continue
+        deps = cover_deps(m)
+        for cn in m.hit_order:
+            key = f'{m.name}.{cn}'
+            row = {'key': key, 'covergroup': m.name, 'cover': cn, 'class': w['cls']['path']}
+            if cn not in r['reached']:
+                row['status'] = 'unreached' if cn in r['unreached'] else 'unknown'
+                rows.append(row); continue
+            hit = r['reached'][cn]
+            dp = deps.get(cn, set())
+            kinds = {p: w['ports'][p] for p in dp}
+            pins = sorted(p for p, k in kinds.items() if k[0] == 'pin')
+            others = sorted(p for p, k in kinds.items() if k[0] != 'pin')
+            steps = [[(w['ports'][p][1], w['ports'][p][2], s[p], decl_width(m.ports[p][1])) for p in pins if p in s]
+                     for s in hit['samples']]
+            row.update({'status': 'replay' if not others else 'partial', 'randomize_calls': len(steps),
+                        'steps': [{path: val for _, path, val, _ in st} for st in steps],
+                        'needs': {p: {'kind': kinds[p][0], 'why': kinds[p][2],
+                                      'values': [s.get(p) for s in hit['samples']]} for p in others}})
+            rows.append(row)
+            if pins: by_cls.setdefault(w['cls']['path'], (w['cls'], []))[1].append((key, steps))
+    text = replay_sv(gen, by_cls)
+    with open(os.path.join(out, 'fv_replay.sv'), 'w') as f: f.write(text)
+    with open(os.path.join(out, 'replay.json'), 'w') as f: json.dump(rows, f, indent=1)
+    gen.replay_rows = rows
+    return rows
+
+
+def replay_sv(gen, by_cls):
+    hdr = (f'// Generated by fvgen from {os.path.basename(gen.a.json)} -- do not edit.\n'
+           '// Override classes that replay formal witnesses: compile after the testbench packages, then run\n'
+           '// any test (any seed) with the class overridden and +FV_HIT=<covergroup module>.<cover>\n'
+           '// (replay.json / report.md list the keys). The first randomize() calls of the overriding class\n'
+           '// take the witness values of the fields the bin depends on; the other fields, and later calls,\n'
+           '// stay random under the class\'s own constraints.\n')
+    if not by_cls: return hdr + '// (no covergroup samples fields of a randomized class)\n'
+    uvm = any(any(str(x).startswith('uvm_') for x in c.get('lineage', [])) for c, _ in by_cls.values())
+    pkgs = sorted({p.rsplit('::', 1)[0] for p in by_cls if '::' in p})
+    body = [hdr, '`ifndef FV_REPLAY_SV', '`define FV_REPLAY_SV']
+    if uvm: body.append('`include "uvm_macros.svh"')
+    body.append('package fv_replay_pkg;')
+    if uvm: body.append('  import uvm_pkg::*;')
+    for path, (c, covers) in sorted(by_cls.items()):
+        body.append(replay_class(gen, c, covers))
+    body += ['endpackage', '`endif', '']
+    return '\n'.join(body)
+
+
+def replay_class(gen, c, covers):
+    name = ident(c['name'] + '__fv_replay')
+    base = c['path']
+    params = c.get('parameters') or []
+    if params:
+        base += ' #(' + ', '.join(f".{p['name']}({p.get('value') or p.get('type_param')})" for p in params) + ')'
+    lineage = [str(x) for x in c.get('lineage', [])]
+    fields = {}
+    for key, steps in covers:
+        for st in steps:
+            for leaf, path, val, w in st: fields[leaf] = (path, w)
+    L = [f"  // {c['name']} ({c['file']}:{c['start']}): {len(covers)} bins",
+         f'  class {name} extends {base};']
+    if 'uvm_component' in lineage:
+        L += [f'    `uvm_component_utils({name})',
+              f'    function new(string name = "{name}", uvm_component parent = null); super.new(name, parent); endfunction']
+    elif any(x.startswith('uvm_') for x in lineage):
+        L += [f'    `uvm_object_utils({name})',
+              f'    function new(string name = "{name}"); super.new(name); endfunction']
+    else:
+        ctor = next((s for s in gen.d['subroutines'] if s.get('path') == c['path'] + '::new'), None)
+        args = (ctor or {}).get('args') or []
+        formals = ', '.join(f"{a.get('type', '')} {a['name']}" + (f" = {a['default']}" if a.get('default') else '')
+                            for a in args)
+        L.append(f"    function new({formals}); super.new({', '.join(a['name'] for a in args)}); endfunction")
+    L += ['    static int fv_id = -2;      // bin selected by +FV_HIT (-1: none)',
+          '    static int fv_step = 0;     // randomize() calls made so far']
+    for leaf, (path, w) in sorted(fields.items()):
+        L.append(f'    bit fv_en_{leaf};  logic [{w - 1}:0] fv_v_{leaf};  // {path}')
+    L.append('    constraint fv_replay_c {')
+    for leaf, (path, w) in sorted(fields.items()):
+        L.append(f'      fv_en_{leaf} -> {path} == fv_v_{leaf};')
+    L.append('    }')
+    L += ['    static function int fv_id_of(string key);', '      case (key)']
+    for i, (key, _) in enumerate(covers):
+        L.append(f'        "{key}": return {i};')
+    L += ['        default: return -1;', '      endcase', '    endfunction']
+    L += ['    function void fv_load();', '      string key;',
+          '      if (fv_id == -2) begin',
+          '        fv_id = $value$plusargs("FV_HIT=%s", key) ? fv_id_of(key) : -1;',
+          f'        if (fv_id == -1 && key != "") $display("fv_replay: +FV_HIT=%s is not a bin of {c["name"]}", key);',
+          '      end']
+    for leaf in sorted(fields): L.append(f'      fv_en_{leaf} = 0;')
+    L += ['      case (fv_id)']
+    for i, (key, steps) in enumerate(covers):
+        L.append(f'        {i}: case (fv_step)  // {key}')
+        for k, st in enumerate(steps):
+            sets = ' '.join(f"fv_en_{leaf} = 1; fv_v_{leaf} = {w}'h{val:x};" for leaf, _, val, w in st)
+            L.append(f'          {k}: begin {sets} end')
+        L.append('          default: ;')
+        L.append('        endcase')
+    L += ['        default: ;', '      endcase', '    endfunction']
+    L += ['    function void pre_randomize(); super.pre_randomize(); fv_load(); endfunction',
+          '    function void post_randomize(); super.post_randomize(); if (fv_id >= 0) fv_step++; endfunction',
+          '  endclass', '']
+    return '\n'.join(L)
+
+
+def run_jobs(gen, jobs, n_jobs=8, on_done=None):
+    """run the sby jobs; (job, status, reached, unreached, err, extra) per job. on_done(job, jobdir,
+    summary lines) runs before the job directory is removed and its result becomes `extra`."""
+
+    def one(job):
+        sd, top = job.d, job.top
         # own process group, so a timeout also kills the solver processes sby started
         p = subprocess.Popen(['sby', '-f', top + '.sby'], cwd=sd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -2813,28 +3168,35 @@ def run_smoke(gen, out, jobs=8):
         for st in ('PASS', 'FAIL', 'UNKNOWN', 'ERROR', 'TIMEOUT'):
             fp = os.path.join(sd, top, st)
             if os.path.exists(fp): full = ['summary:' + l for l in open(fp).read().splitlines()]
+        summary = [l.split('summary:', 1)[1] for l in (full or log.splitlines()) if 'summary:' in l]
         reached, unreached, in_unr = set(), set(), False
-        for line in full or log.splitlines():
-            if 'summary:' not in line: continue
-            body = line.split('summary:', 1)[1]
+        for body in summary:
             mm = re.match(r'\s+reached cover statement (\S+) at', body)
             if mm: reached.add(mm.group(1).split('.')[-1]); in_unr = False; continue
             if 'unreached cover statements:' in body: in_unr = True; continue
-            mm = re.match(r'\s{3,}(\S+) at ', body)
+            # listed indented under the header (two spaces in the PASS/FAIL file, three in the log)
+            mm = re.match(r'\s{2,}(\S+) at ', body)
             if in_unr and mm: unreached.add(mm.group(1).split('.')[-1]); continue
-            in_unr = in_unr and body.startswith('   ')
+            in_unr = in_unr and body.startswith('  ')
+        if job.names is not None:          # covers outside the job's range are disabled, not unreachable
+            keep = set(job.names)
+            reached &= keep
+            unreached = (unreached & keep) | (keep - reached if 'DONE (PASS' in log else set())
         status = next((st for st in ('PASS', 'FAIL', 'TIMEOUT') if f'DONE ({st}' in log), 'ERROR')
         err = None
         if status == 'ERROR':
             err = '\n'.join(l for l in log.splitlines() if 'ERROR' in l or 'rror' in l)[:800]
         elif status == 'TIMEOUT':
             err = f'sby did not finish in {gen.a.timeout}s'
+        extra = None
+        if on_done is not None:
+            try: extra = on_done(job, os.path.join(sd, top), summary)
+            except Exception as e: err = (err or '') + f' (trace parsing: {e})'
         if not gen.a.keep: shutil.rmtree(os.path.join(sd, top), ignore_errors=True)
-        return top, m, status, reached, unreached, err
+        return job, status, reached, unreached, err, extra
 
-    with ThreadPoolExecutor(jobs) as ex:
-        results = list(ex.map(one, gen.smokes))
-    return results
+    with ThreadPoolExecutor(n_jobs) as ex:
+        return list(ex.map(one, jobs))
 
 
 def summarize(gen):
@@ -2857,7 +3219,8 @@ def summarize(gen):
                        'assumes': sum(len(e.get('assumes', [])) for e in cons),
                        'covers': sum(len(e.get('covers', [])) for e in bins),
                        'asserts': sum(len(e.get('asserts', [])) for e in bins)},
-            'entries': gen.report, 'smoke': getattr(gen, 'smoke_results', None)}
+            'entries': gen.report, 'smoke': getattr(gen, 'smoke_results', None),
+            'replay': getattr(gen, 'replay_rows', None)}
 
 
 def report_md(rep):
@@ -2876,6 +3239,30 @@ def report_md(rep):
                    f"unsatisfiable constraint sets: {s['unsat']}")
         out.append(f"- covers reached: {s['reached']}/{s['covers']}\n")
         for line in s.get('problems', [])[:200]: out.append(f'- {line}')
+        out.append('')
+    if rep.get('replay') is not None:
+        rows = rep['replay']
+        out.append('## Hitting a bin in simulation (witness replay)\n')
+        out.append('Each bin below was reached formally from the `randomize()` model of the class its covergroup '
+                   'samples (sampled once per call). To hit it in simulation with any seed: compile `fv_replay.sv` '
+                   'after the testbench packages and run with the class overridden by `fv_replay_pkg::<class>__fv_replay` '
+                   '(UVM: `+uvm_set_type_override=<class>,<class>__fv_replay`; parameterized classes: '
+                   '`<class>#(..)::type_id::set_type_override(fv_replay_pkg::<class>__fv_replay::get_type())`) plus '
+                   '`+FV_HIT=<key>`. **replay**: the bin depends only on fields the override pins. **partial**: it also '
+                   'depends on values the override cannot set (listed: testbench state, monitor data). **unreached**: no '
+                   'sequence of randomize() calls within the bound reaches it under the constraints.\n')
+        cnt = {}
+        for r in rows: cnt[r['status']] = cnt.get(r['status'], 0) + 1
+        out.append('- ' + ', '.join(f'{k}: {v}' for k, v in sorted(cnt.items())) + '\n')
+        for r in rows[:3000]:
+            if r['status'] in ('replay', 'partial'):
+                st = ' ; '.join('{' + ', '.join(f'{k}={v}' for k, v in x.items()) + '}' for x in r['steps'])
+                out.append(f"- **{r['status']}** `+FV_HIT={r['key']}` ({r['class']}, {r['randomize_calls']} randomize() "
+                           f"calls): {st}")
+                for p, n in r.get('needs', {}).items():
+                    out.append(f"  - also needs `{p}` = {n['values']} ({n['why']})")
+            else:
+                out.append(f"- **{r['status']}** `{r['key']}` ({r['class']})")
         out.append('')
     def sect(title, kinds):
         rows = [e for e in rep['entries'] if e.get('kind') in kinds and e.get('status', 'exact') != 'exact']
@@ -2930,6 +3317,10 @@ def main():
     ap.add_argument('-j', '--jobs', type=int, default=8)
     ap.add_argument('--timeout', type=int, default=600)
     ap.add_argument('--sat-timeout', type=int, default=20, help='seconds per soft-constraint resolution query')
+    ap.add_argument('--cover-chunk', type=int, default=200, help='covers per formal job (large covergroups are split)')
+    ap.add_argument('--witness', action='store_true', help='reach every bin from the randomize() model of the class '
+                    'whose fields the covergroup samples, and write fv_replay.sv: override classes that make a '
+                    'simulation hit a chosen bin with any seed')
     ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')
     a = ap.parse_args()
     d = json.load(open(a.json))
@@ -2937,13 +3328,15 @@ def main():
     gen.run()
     rep = write_outputs(gen, a.out)
     if a.run:
-        res = run_smoke(gen, a.out, a.jobs)
+        res = run_jobs(gen, gen.smokes, a.jobs)
         probs, reached, total, errs, unsat, tmo = [], 0, 0, 0, 0, 0
-        for top, m, status, rch, unr, err in res:
+        for job, status, rch, unr, err, _ in res:
+            m = job.m
+            where = m.name + (f' [covers {job.names[0]}..{job.names[-1]}]' if job.names and len(job.names) < len(m.hit_order) else '')
             if status == 'ERROR':
-                errs += 1; probs.append(f'{m.name}: sby error: {err}'); continue
+                errs += 1; probs.append(f'{where}: sby error: {err}'); continue
             if status == 'TIMEOUT':
-                tmo += 1; probs.append(f'{m.name}: {err} (covers reached so far: {len(rch)})'); continue
+                tmo += 1; probs.append(f'{where}: {err} (covers reached so far: {len(rch)})'); continue
             if m.kind == 'constraints':
                 if 'sat' not in rch:
                     unsat += 1
@@ -2957,8 +3350,11 @@ def main():
             else:
                 total += len(rch) + len(unr); reached += len(rch)
                 for x in sorted(unr): probs.append(f'{m.name}: bin unreachable with free inputs: {x}')
-        gen.smoke_results = {'modules': len(res), 'errors': errs, 'timeouts': tmo, 'unsat': unsat, 'covers': total,
-                             'reached': reached, 'problems': probs}
+        gen.smoke_results = {'modules': len({j.m.name for j in gen.smokes}), 'jobs': len(res), 'errors': errs,
+                             'timeouts': tmo, 'unsat': unsat, 'covers': total, 'reached': reached, 'problems': probs}
+    if a.witness:
+        witness(gen, a.out)
+    if a.run or a.witness:
         rep = summarize(gen)
         with open(os.path.join(a.out, 'report.json'), 'w') as f:
             json.dump(rep, f, indent=1, default=lambda o: sorted(o) if isinstance(o, set) else str(o))
@@ -2970,6 +3366,11 @@ def main():
         s = rep['smoke']
         print(f"smoke: {s['modules']} modules, {s['errors']} errors, {s['timeouts']} timeouts, {s['unsat']} unsat, "
               f"covers {s['reached']}/{s['covers']}")
+    if rep.get('replay') is not None:
+        rows = rep['replay']
+        cnt = {}
+        for r in rows: cnt[r['status']] = cnt.get(r['status'], 0) + 1
+        print('witness: ' + ', '.join(f'{k} {v}' for k, v in sorted(cnt.items())) + ' -> fv_replay.sv, replay.json')
     print(f'-> {a.out}')
 
 

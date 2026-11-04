@@ -183,12 +183,18 @@ def test_fv_extraction():
                          {'values': ['7'], 'repeat': {'kind': '=', 'from': '2', 'to': '2'}}]]
     assert cps['op']['ti']['enum'][2]['name'] == 'AT'
 
+    # covergroup with function sample(...): its arguments, with class types resolvable by path
+    pg = next(g for g in d['coverage']['covergroups'] if g['name'] == 'pkg_cg')
+    assert [(a['name'], a['ti'].get('class_path') or a['ti']['kind']) for a in pg['sample_args']] == \
+        [('t', 'fv_pkg::item'), ('k', 'PredefinedIntegerType')]
+    assert ti['q'].get('class_path') is None
+
     # constraint_mode / rand_mode setters: receiver, block or field (None: the whole object), value
     run = subs['run']['facts']['calls']
     modes = [(c['name'], c['receiver'], c['member'], c['value'], c['line']) for c in run
              if c['name'] in ('constraint_mode', 'rand_mode')]
-    assert modes == [('constraint_mode', 'it', 'c_off', '0', 44), ('rand_mode', 'it', 'n', '0', 45),
-                     ('constraint_mode', 'it', None, "1'b1", 46), ('rand_mode', 'it', None, "1'b0", 48)]
+    assert modes == [('constraint_mode', 'it', 'c_off', '0', 49), ('rand_mode', 'it', 'n', '0', 50),
+                     ('constraint_mode', 'it', None, "1'b1", 51), ('rand_mode', 'it', None, "1'b0", 53)]
 
 
 def test_invalid_code():

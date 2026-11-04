@@ -37,6 +37,11 @@ package fv_pkg;
     function new(); cg = new(); endfunction
   endclass
 
+  // `with function sample(...)` at package level: the arguments are the sampled values
+  covergroup pkg_cg with function sample(item t, int k);
+    cp_ta : coverpoint t.a;
+  endgroup
+
   class user;
     item it;
     task run();
