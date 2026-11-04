@@ -1,6 +1,8 @@
+__pycache__/
+*.pyc
+sniper_out.json
+obj_dir/
 # generated: fvgen output, SymbiYosys runs and the .sby files the example Makefile writes
 examples/fv_axi/fv/
 examples/fv_axi/formal_*/
 examples/fv_axi/formal_*.sby
-__pycache__/
-obj_dir/
