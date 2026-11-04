@@ -3166,11 +3166,11 @@ class Job:
     does not parse every module), and the covers it is responsible for"""
 
     def __init__(self, d, top, src, mods, depth, defs, m, names=None, traces=False, pre='', post='',
-                 multiclock=False, mode='cover'):
+                 multiclock=False):
         self.d, self.top, self.src, self.mods, self.depth, self.defs = d, top, src, mods, depth, defs
         self.m, self.names, self.traces = m, names, traces
         self.pre, self.post = pre, post     # yosys commands before reading the top / after flattening
-        self.multiclock, self.mode = multiclock, mode     # both clock edges: clk2fflogic; 'bmc': asserts
+        self.multiclock = multiclock        # both clock edges: clk2fflogic, every edge a step
 
     PREP = ('hierarchy -smtcheck; scc -select; simplemap; select -clear; memory_nordff; async2sync; '
             'chformal -assume -early; opt_clean; formalff -setundef -clk2ff -ff2anyinit -hierarchy; '
@@ -3189,13 +3189,10 @@ class Job:
         if self.multiclock:     # as sby's multiclock mode: every clock edge is a step
             prep = prep.replace('async2sync; chformal -assume -early; opt_clean; formalff -setundef -clk2ff '
                                 '-ff2anyinit -hierarchy; ', 'clk2fflogic; ')
-        if self.mode == 'bmc':
-            prep = prep.replace('chformal -live -fair -assert -remove', 'chformal -live -fair -cover -remove')
         ys = (f'{self.pre}read_verilog -sv -formal -DFORMAL{self.defs} -I{out_dir} {self.top}_lib.sv {self.top}.sv; '
               f'{post}prep -top {self.top}; {prep}; write_smt2{wires} {self.top}/model.smt2')
         depth = self.depth * (2 if self.multiclock else 1)
-        smt = ['yosys-smtbmc', '-s', gen.a.solver, '--presat', '--unroll', '--noprogress', '-t', str(depth)]
-        smt += ['-c'] if self.mode == 'cover' else ['--keep-going']
+        smt = ['yosys-smtbmc', '-s', gen.a.solver, '--presat', '--unroll', '-c', '--noprogress', '-t', str(depth)]
         if self.traces: smt += ['--dump-vcd', f'{self.top}/trace%.vcd']
         return ['yosys', '-q', '-p', ys], smt + [f'{self.top}/model.smt2']
 
@@ -3576,12 +3573,13 @@ class RtlMap:
         with tempfile.TemporaryDirectory(prefix='fvrtl_') as d:
             js = os.path.join(d, 'dut.json')
             r = subprocess.run(['yosys', '-q', '-p', f'plugin -i slang; read_slang --single-unit {self.slang_args()} '
-                                f'{self.top_args()}; write_json -noscopeinfo {js}'],
+                                f'{self.top_args()}; write_json -noscopeinfo {js}; proc; opt_clean; '
+                                f'write_json -noscopeinfo {js}.opt'],
                                capture_output=True, text=True)
             if r.returncode or not os.path.exists(js):
                 sys.exit('reading the DUT with yosys-slang failed:\n' + (r.stdout + r.stderr)[-2000:])
-            mods = json.load(open(js))['modules']
-            m = mods[self.a.rtl_top]
+            m = json.load(open(js))['modules'][self.a.rtl_top]          # as elaborated: names to probe
+            mods = json.load(open(js + '.opt'))['modules']              # without logic nothing uses
         # both clock edges in the design (a negedge checker): the formal run needs multiclock mode
         self.mixed_edges = False
         for mm in mods.values():
@@ -3712,8 +3710,17 @@ def rtl_flow(gen, out):
     lowered, sva = None, []
     if a.rtl_sva:
         import svalower
+        # only assumptions on the DUT's interface: those of the testbench's bound checkers (a protocol
+        # checker assumes legal traffic) and those written in the DUT's top module. Assumptions inside
+        # submodules constrain internal signals; assertions and covers are not needed to reach bins
+        bind_files = set()
+        for fl in a.rtl_bind or []:
+            bind_files |= {x for x in svalower.flatten_args(['-f', os.path.abspath(fl)]) if os.path.isfile(x)}
+        def keep(kind, module, path):
+            if path in bind_files or module == a.rtl_top: return None
+            return f'assumption inside {module}, not on the DUT interface'
         lowered, sva = svalower.lower_filelists((a.rtl or []) + (a.rtl_bind or []), os.path.join(rd, 'sva'),
-                                                a.rtl_define or [])
+                                                a.rtl_define or [], kinds=('assume',), keep=keep)
     rm = RtlMap(gen, lowered)
     mc = rm.mixed_edges
     clk = [p for p, (d, w) in rm.ports.items() if d == 'input' and w == 1 and re.search(r'clk|clock', p, re.I)]
@@ -3792,18 +3799,9 @@ def rtl_flow(gen, out):
                 'module fv_rtl_top', f'module {top}')
             jobs.append(Job(rd, top, src, [only_covers(m, names)], a.rtl_depth, ' -DFV_NO_ILLEGAL_BINS', m, names,
                             pre=pre, post=post, multiclock=mc))
-    if a.rtl_asserts:       # the design's and the bound checkers' assertions, under their assumptions
-        pre = f'plugin -i slang; read_slang --single-unit {rm.slang_args()} {rm.top_args()}; '
-        jobs.append(Job(rd, 'rtl_asserts', '\n'.join(dut_top('rtl_asserts') + ['endmodule']), [], a.rtl_assert_depth,
-                        '', None, None, pre=pre, post='opt_clean', multiclock=mc, mode='bmc'))
     for j in jobs: j.write(gen)
     res = run_jobs(gen, jobs, a.jobs, on_done=lambda job, hits: {c: st for c, (_, st) in hits.items()})
-    gen.rtl_info['asserts'] = None
     for job, status, rch, unr, err, steps in res:
-        if job.mode == 'bmc':
-            gen.rtl_info['asserts'] = {'status': status, 'error': err, 'depth': a.rtl_assert_depth,
-                                       'failed': steps or {}}
-            continue
         for c in job.names:
             row = {'covergroup': job.m.name, 'cover': c}
             if c in rch: row.update(status='reached', step=(steps or {}).get(c))
@@ -3852,12 +3850,7 @@ def run_jobs(gen, jobs, n_jobs=8, on_done=None):
             elif 'Status: PASSED' in log or 'Status: FAILED' in log: status = 'PASS' if 'PASSED' in log else 'FAIL'
             else: status, err = 'ERROR', log[-800:]
         reached, unreached, pending, traces = {}, set(), [], {}
-        failed, step_now = {}, 0
         for line in log.splitlines():
-            mm = re.search(r'Checking assertions in step (\d+)', line)
-            if mm: step_now = int(mm.group(1))
-            mm = re.search(r'Assert failed in \S+: (\S+)', line)
-            if mm: failed.setdefault(mm.group(1), step_now // (2 if job.multiclock else 1))
             mm = re.search(r'Reached cover statement in step (\d+) at \S+: (\S+)', line)
             if mm:      # flattened designs name covers by instance path (u_cg.cov_x)
                 c = mm.group(2).split('.')[-1]
@@ -3879,7 +3872,6 @@ def run_jobs(gen, jobs, n_jobs=8, on_done=None):
             try: extra = on_done(job, {c: (traces.get(c), reached[c]) for c in rset})
             except Exception as e: err = (err or '') + f' (trace parsing: {e})'
         if not gen.a.keep: shutil.rmtree(jd, ignore_errors=True)
-        if job.mode == 'bmc': extra = failed
         return job, status, rset, unreached - rset, err, extra
 
     with ThreadPoolExecutor(n_jobs) as ex:
@@ -3946,18 +3938,12 @@ def report_md(rep):
         if sva:
             cnt = {}
             for x in sva: cnt[(x['kind'], x['status'])] = cnt.get((x['kind'], x['status']), 0) + 1
-            out.append('- concurrent SVA in the RTL and binds (lowered to immediate assertions: assumes constrain the '
-                       'runs): ' + ', '.join(f'{k} {st}: {n}' for (k, st), n in sorted(cnt.items())))
+            out.append('- concurrent SVA in the RTL and binds: assumptions lowered (they constrain the runs), '
+                       'assertions and covers left out: ' + ', '.join(f'{k} {st}: {n}' for (k, st), n in sorted(cnt.items())))
             why = {}
             for x in sva:
-                if x['why']: why[x['why'][:80]] = why.get(x['why'][:80], 0) + 1
+                if x['why'] and x['status'] == 'unsupported': why[x['why'][:80]] = why.get(x['why'][:80], 0) + 1
             for w, n in sorted(why.items(), key=lambda kv: -kv[1])[:12]: out.append(f'  - not lowered ({n}): {w}')
-        asr = info.get('asserts')
-        if asr:
-            out.append(f"- assertions checked {asr['depth']} cycles from reset under the assumptions: "
-                       f"{asr['status']}" + (f" ({asr['error']})" if asr.get('error') else ''))
-            for nm, st in sorted((asr.get('failed') or {}).items(), key=lambda kv: kv[1]):
-                out.append(f'  - **fails** at cycle {st}: `{nm}`')
         for mname, mp in (info.get('maps') or {}).items():
             out.append(f'- `{mname}` inputs:')
             for port, x in mp.items():
@@ -4068,10 +4054,7 @@ def main():
     ap.add_argument('--rtl-bind', action='append', help='slang argument file with the testbench\'s bind modules '
                     'and the checkers they bind into the DUT (repeatable)')
     ap.add_argument('--no-rtl-sva', dest='rtl_sva', action='store_false',
-                    help='do not lower concurrent SVA (svalower); yosys-slang then drops it')
-    ap.add_argument('--rtl-asserts', action='store_true', help='also check the lowered assertions under the '
-                    'lowered assumptions (bounded, --rtl-assert-depth cycles)')
-    ap.add_argument('--rtl-assert-depth', type=int, default=20)
+                    help='do not lower the concurrent SVA assumptions (svalower); yosys-slang then drops them')
     ap.add_argument('--rtl-reset-low', type=lambda v: v.lower() in ('1', 'true', 'yes'), default=None,
                     help='reset is active low (default: name ends in n / ni)')
     ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')

@@ -172,18 +172,18 @@ DUT-internal signals are probed after flattening. The report lists, per covergro
 signal it maps to and why; per bin **reached** (with the cycle), **unreached** (not within
 `--rtl-depth`: no proof), or **unmapped** (an input with no RTL counterpart: testbench state).
 
-Concurrent SVA in the RTL and in the testbench's bind files (`--rtl-bind`: bind modules and the
-checkers they bind, e.g. OpenTitan's `tlul_assert`) is lowered by `svalower.py` (below), so the
-design's and the checkers' **assumptions constrain the runs** (a device-side protocol checker
-assumes legal bus traffic) and `--rtl-asserts` checks their **assertions** under those assumptions
-for `--rtl-assert-depth` cycles, listing each failing assertion with its cycle. A design that uses
-both clock edges runs in multiclock mode (inputs change at the rising edge, as a clocked driver
-drives them). Not yet: the testbench drivers' behaviour as input constraints.
+The **assumptions** in the RTL and in the testbench's bind files (`--rtl-bind`: bind modules and the
+checkers they bind, e.g. OpenTitan's `tlul_assert`, whose device side assumes legal bus traffic) are
+lowered by `svalower.py` (below) and constrain the runs: they describe the interface. Assertions and
+covers of the design and the checkers are left out (the runs are about reaching bins), and so is the
+logic only they used. A design that still uses both clock edges runs in multiclock mode (inputs change
+at the rising edge, as a clocked driver drives them). Not yet: the testbench drivers' behaviour as
+input constraints.
 
 ### `svalower.py`: concurrent SVA for yosys-slang
 
 ```sh
-python svalower.py -o out/ -f rtl.f -f bind.f      # out/lowered.f + rewritten copies + sva_report.json
+python svalower.py -o out/ -f rtl.f -f bind.f [--kinds assume]   # out/lowered.f + copies + sva_report.json
 ```
 
 yosys-slang reads immediate assertions only. Every `assert/assume/cover property` (written directly or

@@ -33,6 +33,10 @@ class Unsupported(Exception):
     pass
 
 
+class Skipped(Exception):
+    """a kind of property the caller does not want (e.g. fvgen --rtl keeps only assumptions)"""
+
+
 def kids(n):
     for c in n:
         if hasattr(c, 'kind') and not isinstance(c, pyslang.parsing.Token):
@@ -294,6 +298,14 @@ def cumulative(sq):
     return out
 
 
+def module_name(n):
+    m = n
+    while m is not None and getattr(m, 'kind', None) not in (SK.ModuleDeclaration, SK.InterfaceDeclaration,
+                                                              SK.ProgramDeclaration):
+        m = getattr(m, 'parent', None)
+    return m.header.name.valueText if m is not None else None
+
+
 def module_defaults(n):
     """(default clocking event, default disable iff expression) of the enclosing module"""
     m = n
@@ -356,7 +368,7 @@ def original_range(sm, rng):
     return s, e
 
 
-def run(slang_args, out_dir):
+def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
     d = pyslang.driver.Driver()
     d.addStandardArgs()
     if not d.parseCommandLine('slang ' + ' '.join(slang_args), pyslang.driver.CommandLineOptions()):
@@ -415,13 +427,22 @@ def run(slang_args, out_dir):
             line = sm.getLineNumber(s)
             if not label: label = f'sva_{os.path.basename(path).split(".")[0]}_{line}'
             label = re.sub(r'\W', '_', label)
+            module = module_name(st)
             try:
+                if kind not in kinds:
+                    raise Skipped(f'{kind} not kept (kept: {", ".join(kinds)})')
+                if keep is not None:
+                    why = keep(kind, module, os.path.abspath(path))
+                    if why: raise Skipped(why)
                 text = low.lower(st, kind, label, module_defaults(st))
                 status, why = 'lowered', None
+            except Skipped as ex:
+                text = f'  // svalower: {kind} property {label} left out: {ex}'
+                status, why = 'skipped', str(ex)
             except Unsupported as ex:
                 text = f'  // svalower: {kind} property {label} removed: {ex}'
                 status, why = 'unsupported', str(ex)
-            report.append({'name': label, 'kind': kind, 'file': path, 'line': line, 'status': status,
+            report.append({'name': label, 'kind': kind, 'module': module, 'file': path, 'line': line, 'status': status,
                            'why': why, 'src': txt(st)[:200]})
             edits.setdefault(path, {})[(s.offset, e.offset)] = text
     files = {}
@@ -465,14 +486,14 @@ def flatten_args(args, base=None):
     return out
 
 
-def lower_filelists(filelists, out_dir, defines=()):
+def lower_filelists(filelists, out_dir, defines=(), kinds=('assert', 'assume', 'cover'), keep=None):
     """lowered copy of the sources named by slang argument files: (path of the new flat filelist,
-    report)"""
+    report). Properties of other kinds than `kinds` are left out of the copies."""
     out_dir = os.path.abspath(out_dir)      # callers run tools from other directories
     args = []
     for f in filelists: args += flatten_args(['-f', os.path.abspath(f)])
     args += [f'+define+{x}' for x in defines]
-    files, report = run(args, out_dir)
+    files, report = run(args, out_dir, kinds, keep)
     flat = [files.get(a, a) for a in args]
     fl = os.path.join(out_dir, 'lowered.f')
     with open(fl, 'w') as f: f.write('\n'.join(flat) + '\n')
@@ -485,8 +506,9 @@ def main():
     ap.add_argument('-o', '--out', required=True)
     ap.add_argument('-f', dest='filelists', action='append', default=[], help='slang argument file')
     ap.add_argument('-D', dest='defines', action='append', default=[])
+    ap.add_argument('--kinds', default='assert,assume,cover', help='property kinds to keep (others are left out)')
     a = ap.parse_args()
-    fl, rep = lower_filelists(a.filelists, a.out, a.defines)
+    fl, rep = lower_filelists(a.filelists, a.out, a.defines, tuple(a.kinds.split(',')))
     n = {}
     for r in rep: n[r['status']] = n.get(r['status'], 0) + 1
     print(f'{n} -> {fl}')

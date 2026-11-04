@@ -748,7 +748,7 @@ def test_rtl_covers():
     open(os.path.join(work, 'bind.f'), 'w').write(os.path.join(HERE, 'rtl_chk.sv') + '\n' +
                                                  os.path.join(HERE, 'rtl_bind.sv') + '\n')
     run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl', 'rtl.f', '--rtl-bind', 'bind.f',
-         '--rtl-top', 'rf_dut', '--rtl-depth', '14', '--rtl-asserts', '--rtl-assert-depth', '12'], cwd=work)
+         '--rtl-top', 'rf_dut', '--rtl-depth', '14'], cwd=work)
     rep = json.load(open(os.path.join(work, 'fv', 'report.json')))
     info = rep['rtl_info']
     assert (info['instance'], info['clock'], info['reset'], info['reset_active_low']) == \
@@ -769,15 +769,12 @@ def test_rtl_covers():
     assert rows['cov_cp_mode__auto_3']['status'] == 'unreached'
     assert (rows['cov_cp_busy__auto_0'].get('step'), rows['cov_cp_busy__auto_1'].get('step')) == (4, 5)
     assert rows['cov_cp_x__one']['status'] == 'unmapped'
-    # concurrent SVA: lowered (DUT and bound checker), assertions checked under the assumption
+    # concurrent SVA: only the assumption is kept (it describes the interface); the design's and the
+    # bound checker's assertions and covers are left out of the cover runs
     sva = {x['name']: x['status'] for x in info['sva']}
-    assert sva == {'cfg_never_3_M': 'lowered', 'level_max_A': 'lowered', 'read_empty_A': 'lowered',
-                   'fill_C': 'lowered', 'full_hold_A': 'lowered'}, sva
+    assert sva == {'cfg_never_3_M': 'lowered', 'level_max_A': 'skipped', 'read_empty_A': 'skipped',
+                   'fill_C': 'skipped', 'full_hold_A': 'skipped'}, sva
     assert info['tops'] == ['rf_dut', 'rf_bind'] and not info['multiclock']
-    asr = info['asserts']
-    # reading the empty FIFO right after reset (cycle 3) fails the check at the next edge, reported a step
-    # later as covers are (level 0 at cycle 4)
-    assert asr['failed'] == {'u_dut.read_empty_A': 5}, asr
     shutil.rmtree(work, ignore_errors=True)
     return len(rows)
 
