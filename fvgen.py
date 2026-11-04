@@ -3648,14 +3648,18 @@ class RtlMap:
         e = strip_conv(e or {})
         if e.get('k') == 'Call' and e.get('subroutineName') in ('get_mirrored_value', 'get') and e.get('thisClass'):
             return self.ral(e)
-        chain, x = [], e
+        # the access chain, root first: cfg.vif.sig / vif.cb.sig / vif.sig
+        nodes, x = [], e
         while x.get('k') in ('MemberAccess', 'ElementSelect'):
-            if x['k'] == 'MemberAccess': chain.append(x['member']['sym'])
+            nodes.append(x)
             x = strip_conv(x.get('value') or {})
-        ty = x.get('ty', '') if x.get('k') == 'NamedValue' else ''
-        iface = re.sub(r'^virtual\s+(interface\s+)?', '', ty).split('.')[0].split('#')[0].strip()
-        if chain and iface in self.ifaces:      # a virtual interface handle: vif[.clocking].signal
-            return self.ifsig(iface, chain[0])
+        nodes.append(x)
+        nodes.reverse()
+        members = [n['member']['sym'] for n in nodes if n.get('k') == 'MemberAccess']
+        for i, n in enumerate(nodes[:-1]):
+            iface = re.sub(r'^virtual\s+(interface\s+)?', '', n.get('ty', '')).split('.')[0].split('#')[0].strip()
+            if iface in self.ifaces and members:    # a virtual interface (possibly via a handle): its signal
+                return self.ifsig(iface, members[-1])
         return None, f"{e.get('src') or e.get('k')}: testbench value (no RTL counterpart)"
 
     def field(self, cls, path):
@@ -3765,6 +3769,10 @@ def rtl_flow(gen, out):
         deps = cover_deps(m)
         keep = [c for c in m.hit_order if deps.get(c) and deps[c] <= mapped]
         m.rtl_map = {p: {'source': (list(src) if src else None), 'why': why} for p, (src, why) in mp.items()}
+        # a bin whose inputs all map to DUT input ports is reached by the (free) stimulus alone: it says
+        # nothing about the design until the inputs are constrained by a driver model
+        stim_only = {c for c in keep if all(mp[p][0][0] == 'port' and rm.ports[mp[p][0][1]][0] == 'input'
+                                            for p in deps[c])}
         for c in m.hit_order:
             if c not in keep:
                 gen.rtl_rows.append({'covergroup': m.name, 'cover': c, 'status': 'unmapped',
@@ -3799,12 +3807,13 @@ def rtl_flow(gen, out):
                 'module fv_rtl_top', f'module {top}')
             jobs.append(Job(rd, top, src, [only_covers(m, names)], a.rtl_depth, ' -DFV_NO_ILLEGAL_BINS', m, names,
                             pre=pre, post=post, multiclock=mc))
+            jobs[-1].stim_only = stim_only
     for j in jobs: j.write(gen)
     res = run_jobs(gen, jobs, a.jobs, on_done=lambda job, hits: {c: st for c, (_, st) in hits.items()})
     for job, status, rch, unr, err, steps in res:
         for c in job.names:
             row = {'covergroup': job.m.name, 'cover': c}
-            if c in rch: row.update(status='reached', step=(steps or {}).get(c))
+            if c in rch: row.update(status='reached', step=(steps or {}).get(c), inputs_only=c in job.stim_only)
             elif status in ('PASS', 'FAIL') and c in unr: row['status'] = 'unreached'
             else: row.update(status='error' if status == 'ERROR' else 'timeout', error=err)
             gen.rtl_rows.append(row)
@@ -3928,7 +3937,8 @@ def report_md(rep):
                    f"(active {'low' if info['reset_active_low'] else 'high'}, held 3 cycles), explored {info['depth']} cycles "
                    'from reset. DUT inputs are free (no driver model yet: a reached bin may use input sequences the '
                    'protocol forbids). Covergroups are sampled every cycle, so a bin is reached when the design ever '
-                   'holds that value, whenever the testbench would sample it. **reached**: the design gets there; '
+                   'holds that value, whenever the testbench would sample it. **reached**: the design gets there (a bin '
+                   'that reads only DUT inputs is marked: free inputs reach it trivially); '
                    '**unreached**: not within the bound; **unmapped**: an input has no RTL counterpart.\n')
         for n in info.get('notes') or []: out.append(f'- note: {n}')
         if info.get('multiclock'):
@@ -3954,6 +3964,7 @@ def report_md(rep):
         for r in rep['rtl'][:3000]:
             extra = f" (needs {', '.join(r['needs'])})" if r.get('needs') else (f" ({r['error']})" if r.get('error') else
                      (f" at cycle {r['step']}" if r.get('step') is not None else ''))
+            if r.get('inputs_only'): extra += ' (only DUT inputs: reached by the free stimulus, not the design)'
             out.append(f"- **{r['status']}** `{r['covergroup']}.{r['cover']}`{extra}")
         out.append('')
     if rep.get('replay') is not None:

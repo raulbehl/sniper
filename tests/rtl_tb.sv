@@ -4,6 +4,7 @@
 interface rf_if (input logic clk);
   logic [3:0] level;
   logic busy;
+  logic wr;
 endinterface
 
 package rf_pkg;
@@ -51,10 +52,13 @@ package rf_pkg;
     covergroup busy_cg with function sample(bit b);
       cp_busy : coverpoint b;
     endgroup
+    covergroup wr_cg with function sample(bit w);
+      cp_wr : coverpoint w;
+    endgroup
     covergroup tb_cg with function sample(int x);
       cp_x : coverpoint x { bins one = {1}; }
     endgroup
-    function new(); lvl_cg = new(); mode_cg = new(); busy_cg = new(); tb_cg = new(); endfunction
+    function new(); lvl_cg = new(); mode_cg = new(); busy_cg = new(); wr_cg = new(); tb_cg = new(); endfunction
   endclass
 
   class rf_scoreboard;
@@ -68,6 +72,7 @@ package rf_pkg;
         cov.lvl_cg.sample(vif.level);
         cov.mode_cg.sample(ral.cfg.mode.get_mirrored_value());
         cov.busy_cg.sample(vif.busy);
+        cov.wr_cg.sample(vif.wr);
         cov.tb_cg.sample(model_x);
       end
     endtask
@@ -83,6 +88,7 @@ module rf_tb;
               .level_o(lvl));
   assign rif.level = lvl;
   assign rif.busy = dut.busy;
+  assign rif.wr = wr;
   initial begin
     rf_pkg::rf_scoreboard sb = new();
     sb.vif = rif;

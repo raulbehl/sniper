@@ -769,6 +769,9 @@ def test_rtl_covers():
     assert rows['cov_cp_mode__auto_3']['status'] == 'unreached'
     assert (rows['cov_cp_busy__auto_0'].get('step'), rows['cov_cp_busy__auto_1'].get('step')) == (4, 5)
     assert rows['cov_cp_x__one']['status'] == 'unmapped'
+    # a covergroup on a DUT input is reached by the free stimulus alone, and says so
+    assert src['fv_cg_rf_cov__wr_cg'] == {'w': ['port', 'wr_i']}
+    assert rows['cov_cp_wr__auto_1']['inputs_only'] and not rows['cov_cp_lvl__l__3']['inputs_only']
     # concurrent SVA: only the assumption is kept (it describes the interface); the design's and the
     # bound checker's assertions and covers are left out of the cover runs
     sva = {x['name']: x['status'] for x in info['sva']}
