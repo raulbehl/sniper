@@ -106,6 +106,17 @@ def test_corpus_regressions():
     assert [(w['path'], w['via_handle']) for w in subs['set_pair']['facts']['field_writes']] == [('p.a', False)]
     assert subs['fill']['facts']['field_writes'] == []
     assert [o['path'] for o in d['config']['overrides']] == ['it.p.b']
+    # extern constraints: prototype span plus the out-of-class body; static flag
+    ext = next(c for c in d['classes'] if c['name'] == 'ext_c')
+    assert [(b['name'], b['start'], b['body']['start'], b['body']['end'], b['static']) for b in ext['constraints']] == [
+        ('e_c', 46, 49, 51, False), ('s_c', 47, 52, 52, True)]
+    assert next(c for c in d['classes'] if c['name'] == 'item')['constraints'][0]['static'] is False
+    # a parameterized class nothing specializes is reported through its default specialization
+    g = next(c for c in d['classes'] if c['name'] == 'gen_c')
+    assert g['default_specialization'] and [b['name'] for b in g['constraints']] == ['c_n']
+    assert g['parameters'] == [{'name': 'N', 'value': '4', 'type': 'int'}]
+    assert 'twice' in subs or any(s['name'] == 'twice' for s in d['subroutines'])
+    assert not any(c['default_specialization'] for c in d['classes'] if c['name'] != 'gen_c')
     # code in a generate branch that is not elaborated is marked, not reported as invalid
     assert [(p['start'], p.get('uninstantiated')) for p in d['procedures']] == [(40, True)]
 

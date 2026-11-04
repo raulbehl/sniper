@@ -637,6 +637,7 @@ class Extractor:
         self.covergroups, self.assertions = [], []
         self.types = {'parameters': [], 'typedefs': [], 'enums': []}
         self.imported_pkgs = set()
+        self.default_specs = set()      # (path, line, name) of classes reported by default specialization
         self.seen = set()
 
     # ---- symbol location helpers
@@ -688,7 +689,8 @@ class Extractor:
                 self.seen.add(key)
                 self.classes.append(s)
             elif k == 'GenericClassDef':
-                self.seen.add(key)
+                if key not in self.seen:
+                    self.seen.add(key); generics.append((s, path, line))
             elif k == 'Subroutine' and s.syntax is not None:
                 keep(self.sub_syms, key, s)
             elif k == 'ProceduralBlock':
@@ -697,7 +699,7 @@ class Extractor:
                 keep(self.covergroups, key, s)
             return A.VisitAction.Advance
 
-        first = {}
+        first, generics = {}, []
 
         def keep(lst, key, s):
             # one entry per source construct (generate loops, binds and classes repeat them); an
@@ -707,6 +709,16 @@ class Extractor:
             elif uninstantiated(lst[first[key]]) and not uninstantiated(s):
                 lst[first[key]] = s
         root.visit(visit)
+        # a parameterized class nothing specializes has no members in the elaborated design: report
+        # its default specialization instead (when every parameter has a default)
+        default_spec = A.GenericClassDefSymbol.__dict__['defaultSpecialization'].fget
+        for g, path, line in generics:
+            if ('ClassType', path, line, g.name) in self.seen: continue
+            try: ds = default_spec(g, g.parentScope)
+            except Exception: ds = None
+            if ds is None or ds.kind.name != 'ClassType': continue
+            self.default_specs.add((path, line, g.name))
+            ds.visit(visit)
 
     # ---- types
     def type_entry(self, s, path, line):
@@ -749,6 +761,7 @@ class Extractor:
                'base_type': str(s.baseClass) if s.baseClass is not None else None,
                'lineage': chain, 'uvm_role': role, 'abstract': s.isAbstract,
                'macro_generated': 'macro' in sp,
+               'default_specialization': (self.where(s)[0], self.where(s)[1], s.name) in self.default_specs,
                'implements': [str(i) for i in s.implementedInterfaces] if hasattr(s, 'implementedInterfaces') else [],
                'parameters': [], 'properties': [], 'constraints': [], 'methods': [], 'covergroups': []}
         for m in s:
@@ -792,8 +805,13 @@ class Extractor:
         cs = m.constraints
         items = list(cs.list) if cs is not None and cs.kind.name == 'List' else ([cs] if cs is not None else [])
         ent = {'name': m.name, **self.span(m), 'items': []}
-        try: ent['static'] = bool(m.isStatic)
-        except Exception: pass
+        flags = int(m.flags)
+        F = A.ConstraintBlockFlags
+        ent['static'] = bool(flags & int(F.Static))
+        if flags & int(F.Pure): ent['pure'] = True
+        if flags & int(F.Extern) and cs is not None and cs.syntax is not None:
+            ent['extern'] = True            # span above is the prototype; the body is out of class
+            ent['body'] = self.loc.span(cs.syntax.sourceRange)
         for it in items:
             d = self.ser.node(it)
             ent['items'].append(d)

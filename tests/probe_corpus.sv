@@ -40,3 +40,20 @@ module corpus_top #(parameter bit EN = 0);
     initial pif.data = 0;
   end
 endmodule
+
+class ext_c;
+  rand int a;
+  extern constraint e_c;
+  extern static constraint s_c;
+endclass
+constraint ext_c::e_c {
+  a < 10;
+}
+static constraint ext_c::s_c { a != 3; }
+
+// parameterized class nothing specializes: reported through its default specialization
+class gen_c #(int N = 4);
+  rand int unsigned v;
+  constraint c_n { v < N; }
+  function int twice(); return 2 * v; endfunction
+endclass
