@@ -24,7 +24,7 @@ Generated (OUTDIR)
 Semantics follow IEEE 1800-2017 clauses 18 (constraints) and 19 (coverage); the report states every
 place where the formal model differs from simulation and in which direction.
 """
-import argparse, json, math, os, re, shutil, signal, subprocess, sys, tempfile
+import argparse, copy, json, math, os, re, shutil, signal, subprocess, sys, tempfile, time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -2024,9 +2024,6 @@ class CoverGen:
             mod.body.append('  assign fv_hits = {' + ', '.join(f'({w})' for _, w in reversed(self.hits)) + '};')
         mod.hit_order = [n for n, _ in self.hits]
         mod.hit_wires = dict(self.hits)
-        if self.hits:
-            mod.params += [('FV_COVER_LO', '0', 'first cover enabled (formal runs split covergroups)', 'int'),
-                           ('FV_COVER_HI', str(len(self.hits)), 'covers enabled: index < FV_COVER_HI', 'int')]
         self.gen.mods_cg.append(mod)
         mod.entries = self.entries
         mod.sample_event = cg.get('sample_event')
@@ -2049,7 +2046,7 @@ class CoverGen:
             mod.body.append(f"  always_ff @({self.edge} clk) if (!reset && {w} && {cnt} != {lit(at_least, cw, False)}) "
                             f"{cnt} <= {cnt} + 1'b1;")
             w = f'({w} && {cnt} == {lit(at_least - 1, cw, False)})'
-        mod.body.append(self.stmt('COVER', cn, w, len(self.hits)))
+        mod.body.append(self.stmt('COVER', cn, w))
         ent.setdefault('covers', []).append(cn)
         self.hits.append((cn, w))
         self.n_cover += 1
@@ -2062,15 +2059,13 @@ class CoverGen:
         ent.setdefault('asserts', []).append(an)
         self.n_assert += 1
 
-    def stmt(self, kind, name, prop, idx=None):
+    def stmt(self, kind, name, prop):
         # same reset gating as prim_assert's COVER/ASSERT, but the label is on the statement itself
-        # so SymbiYosys reports each cover by its bin name. Cover idx is on only inside
-        # [FV_COVER_LO, FV_COVER_HI): formal runs split large covergroups into parallel jobs
+        # so SymbiYosys reports each cover by its bin name
         if kind == 'ASSERT' and self.edge == 'posedge':
             return f'  `ASSERT({name}, {prop}, clk, reset)'
         k = {'COVER': 'cover', 'ASSERT': 'assert'}[kind]
-        sel = f' && FV_COVER_LO <= {idx} && {idx} < FV_COVER_HI' if idx is not None else ''
-        return f"  always_ff @({self.edge} clk) if (reset === 1'b0{sel}) {name}: {k} ({prop});"
+        return f"  always_ff @({self.edge} clk) if (reset === 1'b0) {name}: {k} ({prop});"
 
     # ---- coverpoints
     def coverpoint(self, cp):
@@ -2926,6 +2921,16 @@ def cover_depth(m):
     return min(max(4, depth), 24)
 
 
+def only_covers(m, names):
+    """the module with only these cover statements (a job's chunk); the logic of the others is
+    then dead and removed by yosys"""
+    if len(names) == len(m.hit_order): return m
+    keep = set(names)
+    c = copy.copy(m)
+    c.body = [l for l in m.body if not ((mm := re.search(r'\) (\w+): cover \(', l)) and mm.group(1) not in keep)]
+    return c
+
+
 def chunks(m, size):
     """cover index ranges of a covergroup module, at most `size` covers each"""
     n = len(m.hit_order)
@@ -2961,11 +2966,10 @@ def smoke(gen, out):
                 if nm in ('clk', 'reset'): continue
                 lines.append(f'  (* anyseq *) {m.ports[nm][1]};')
                 conns.append(f'.{nm}({nm})')
-            sel = f' #(.FV_COVER_LO({lo}), .FV_COVER_HI({hi}))' if m.hit_order else ''
-            lines.append(f'  {m.name}{sel} u_dut (' + ', '.join(conns) + ');')
+            lines.append(f'  {m.name} u_dut (' + ', '.join(conns) + ');')
             lines.append('endmodule')
-            gen.smokes.append(Job(sd, top, '\n'.join(lines), [m], cover_depth(m), ' -DFV_NO_ILLEGAL_BINS', m,
-                                  m.hit_order[lo:hi]))
+            gen.smokes.append(Job(sd, top, '\n'.join(lines), [only_covers(m, m.hit_order[lo:hi])], cover_depth(m),
+                                  ' -DFV_NO_ILLEGAL_BINS', m, m.hit_order[lo:hi]))
     for j in gen.smokes: j.write(gen)
 
 
@@ -2976,6 +2980,23 @@ class Job:
     def __init__(self, d, top, src, mods, depth, defs, m, names=None, traces=False):
         self.d, self.top, self.src, self.mods, self.depth, self.defs = d, top, src, mods, depth, defs
         self.m, self.names, self.traces = m, names, traces
+
+    PREP = ('hierarchy -smtcheck; scc -select; simplemap; select -clear; memory_nordff; async2sync; '
+            'chformal -assume -early; opt_clean; formalff -setundef -clk2ff -ff2anyinit -hierarchy; '
+            'chformal -live -fair -assert -remove; opt_clean; check; setundef -undriven -anyseq; opt -fast; '
+            'opt_clean; hierarchy -smtcheck; delete */t:$print; formalff -assume; dffunmap')
+
+    def commands(self, gen):
+        """what sby runs for cover mode (its design / prep / smt2 scripts), without the per-cover trace
+        files sby always writes (.yw, testbench, .smtc): writing a trace reads every signal from the
+        solver, which dominated the run time. A VCD only when the job needs traces."""
+        out_dir = os.path.abspath(os.path.dirname(self.d))     # the job runs inside smoke/ or witness/
+        wires = ' -wires' if self.traces else ''
+        ys = (f'read_verilog -sv -formal -DFORMAL{self.defs} -I{out_dir} {self.top}_lib.sv {self.top}.sv; '
+              f'prep -top {self.top}; {self.PREP}; write_smt2{wires} {self.top}/model.smt2')
+        smt = ['yosys-smtbmc', '-s', gen.a.solver, '--presat', '--unroll', '-c', '--noprogress', '-t', str(self.depth)]
+        if self.traces: smt += ['--dump-vcd', f'{self.top}/trace%.vcd']
+        return ['yosys', '-q', '-p', ys], smt + [f'{self.top}/model.smt2']
 
     def write(self, gen):
         with open(os.path.join(self.d, self.top + '.sv'), 'w') as f: f.write(self.src + '\n')
@@ -3061,9 +3082,9 @@ def witness(gen, out):
                 else:
                     lines.append(f'  (* anyseq *) {renamed(m.ports[port][1], port, "f_" + port)};')
                     conns.append(f'.{port}(f_{port})')
-            lines.append(f'  {m.name} #(.FV_COVER_LO({lo}), .FV_COVER_HI({hi})) u_cg (' + ', '.join(conns) + ');')
+            lines.append(f'  {m.name} u_cg (' + ', '.join(conns) + ');')
             lines.append('endmodule')
-            jobs.append(Job(wd, top, '\n'.join(lines), [cm, rm, m], min(cover_depth(m) + 2, 30),
+            jobs.append(Job(wd, top, '\n'.join(lines), [cm, rm, only_covers(m, m.hit_order[lo:hi])], min(cover_depth(m) + 2, 30),
                             ' -DFV_NO_ILLEGAL_BINS', m, m.hit_order[lo:hi], traces=True))
     for j in jobs: j.write(gen)
     res = run_jobs(gen, jobs, gen.a.jobs, on_done=parse_witness)
@@ -3100,24 +3121,13 @@ def read_vcd(path):
     return steps
 
 
-def parse_witness(job, jobdir, summary):
+def parse_witness(job, hits):
     """cover -> {'step', 'samples': [{port: value}]}: the covergroup's inputs at every sample
-    (= every randomize() call) before the cover fired"""
-    hits, trace = {}, None
-    for body in summary:
-        mm = re.match(r'\s*cover trace: (\S+)', body)
-        if mm:
-            # the PASS/FAIL file names traces relative to the job directory, the log relative to the
-            # .sby directory, sometimes as the .yw witness next to the .vcd
-            t = re.sub(r'\.yw$', '.vcd', mm.group(1))
-            trace = next((x for x in (os.path.join(jobdir, t), os.path.join(job.d, t)) if os.path.exists(x)), None)
-            continue
-        mm = re.match(r'\s+reached cover statement (\S+) at .* step (\d+)', body)
-        if mm and trace: hits[mm.group(1).split('.')[-1]] = (trace, int(mm.group(2)))
+    (= every randomize() call the testbench samples) before the cover fired"""
     w = job.m.wit
     cache, out = {}, {}
     for cover, (tr, step) in hits.items():
-        if job.names is not None and cover not in job.names: continue
+        if tr is None: continue
         if tr not in cache: cache[tr] = read_vcd(tr)
         vals = cache[tr]
         samples = []
@@ -3312,50 +3322,63 @@ def replay_class(gen, c, covers):
 
 
 def run_jobs(gen, jobs, n_jobs=8, on_done=None):
-    """run the sby jobs; (job, status, reached, unreached, err, extra) per job. on_done(job, jobdir,
-    summary lines) runs before the job directory is removed and its result becomes `extra`."""
+    """run the jobs (yosys + yosys-smtbmc, what their .sby does); (job, status, reached, unreached,
+    err, extra) per job. on_done(job, {cover: (vcd, step)}) runs before the job directory is removed
+    and its result becomes `extra`."""
+
+    def run(cmd, cwd, deadline):
+        # own process group, so a timeout also kills the solver processes
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             start_new_session=True)
+        try:
+            return p.communicate(timeout=max(1, deadline - time.time()))[0], p.returncode
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            out = p.communicate()[0]
+            for _ in range(50):             # the group's other processes die asynchronously
+                try: os.killpg(p.pid, 0)
+                except (ProcessLookupError, PermissionError): break
+                time.sleep(0.1)
+            return out, None
 
     def one(job):
         sd, top = job.d, job.top
-        # own process group, so a timeout also kills the solver processes sby started
-        p = subprocess.Popen(['sby', '-f', top + '.sby'], cwd=sd, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        try:
-            log = p.communicate(timeout=gen.a.timeout)[0]
-        except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
-            log = p.communicate()[0] + '\nDONE (TIMEOUT)'
-        # the job directory's PASS/FAIL file has the complete summary (the log truncates it)
-        full = []
-        for st in ('PASS', 'FAIL', 'UNKNOWN', 'ERROR', 'TIMEOUT'):
-            fp = os.path.join(sd, top, st)
-            if os.path.exists(fp): full = ['summary:' + l for l in open(fp).read().splitlines()]
-        summary = [l.split('summary:', 1)[1] for l in (full or log.splitlines()) if 'summary:' in l]
-        reached, unreached, in_unr = set(), set(), False
-        for body in summary:
-            mm = re.match(r'\s+reached cover statement (\S+) at', body)
-            if mm: reached.add(mm.group(1).split('.')[-1]); in_unr = False; continue
-            if 'unreached cover statements:' in body: in_unr = True; continue
-            # listed indented under the header (two spaces in the PASS/FAIL file, three in the log)
-            mm = re.match(r'\s{2,}(\S+) at ', body)
-            if in_unr and mm: unreached.add(mm.group(1).split('.')[-1]); continue
-            in_unr = in_unr and body.startswith('  ')
-        if job.names is not None:          # covers outside the job's range are disabled, not unreachable
+        jd = os.path.join(sd, top)
+        shutil.rmtree(jd, ignore_errors=True)
+        os.makedirs(jd)
+        deadline = time.time() + gen.a.timeout
+        ys, smt = job.commands(gen)
+        log, rc = run(ys, sd, deadline)
+        status, err = None, None
+        if rc is None: status, err = 'TIMEOUT', f'model generation did not finish in {gen.a.timeout}s'
+        elif rc != 0: status, err = 'ERROR', '\n'.join(l for l in log.splitlines() if 'rror' in l)[:800] or log[-800:]
+        else:
+            log, rc = run(smt, sd, deadline)
+            if rc is None: status, err = 'TIMEOUT', f'did not finish in {gen.a.timeout}s'
+            elif 'Status: PASSED' in log or 'Status: FAILED' in log: status = 'PASS' if 'PASSED' in log else 'FAIL'
+            else: status, err = 'ERROR', log[-800:]
+        reached, unreached, pending, traces = {}, set(), [], {}
+        for line in log.splitlines():
+            mm = re.search(r'Reached cover statement in step (\d+) at \S+: (\S+)', line)
+            if mm: reached[mm.group(2)] = int(mm.group(1)); pending.append(mm.group(2)); continue
+            mm = re.search(r'Writing trace to VCD file: (\S+)', line)
+            if mm:
+                for c in pending: traces[c] = os.path.join(sd, mm.group(1))
+                pending = []
+                continue
+            mm = re.search(r'Unreached cover statement at \S+: (\S+)', line)
+            if mm: unreached.add(mm.group(1))
+        rset = set(reached)
+        if job.names is not None:
             keep = set(job.names)
-            reached &= keep
-            unreached = (unreached & keep) | (keep - reached if 'DONE (PASS' in log else set())
-        status = next((st for st in ('PASS', 'FAIL', 'TIMEOUT') if f'DONE ({st}' in log), 'ERROR')
-        err = None
-        if status == 'ERROR':
-            err = '\n'.join(l for l in log.splitlines() if 'ERROR' in l or 'rror' in l)[:800]
-        elif status == 'TIMEOUT':
-            err = f'sby did not finish in {gen.a.timeout}s'
+            rset &= keep
+            unreached &= keep
         extra = None
-        if on_done is not None:
-            try: extra = on_done(job, os.path.join(sd, top), summary)
+        if on_done is not None and status in ('PASS', 'FAIL', 'TIMEOUT'):
+            try: extra = on_done(job, {c: (traces.get(c), reached[c]) for c in rset})
             except Exception as e: err = (err or '') + f' (trace parsing: {e})'
-        if not gen.a.keep: shutil.rmtree(os.path.join(sd, top), ignore_errors=True)
-        return job, status, reached, unreached, err, extra
+        if not gen.a.keep: shutil.rmtree(jd, ignore_errors=True)
+        return job, status, rset, unreached - rset, err, extra
 
     with ThreadPoolExecutor(n_jobs) as ex:
         return list(ex.map(one, jobs))
@@ -3397,7 +3420,7 @@ def report_md(rep):
     if rep.get('smoke'):
         s = rep['smoke']
         out.append('## Smoke runs (free inputs, cover mode)\n')
-        out.append(f"- modules: {s['modules']}, sby errors: {s['errors']}, timeouts: {s.get('timeouts', 0)}, "
+        out.append(f"- modules: {s['modules']} ({s.get('jobs', s['modules'])} jobs), tool errors: {s['errors']}, timeouts: {s.get('timeouts', 0)}, "
                    f"unsatisfiable constraint sets: {s['unsat']}")
         out.append(f"- covers reached: {s['reached']}/{s['covers']}\n")
         for line in s.get('problems', [])[:200]: out.append(f'- {line}')
@@ -3501,7 +3524,7 @@ def main():
             m = job.m
             where = m.name + (f' [covers {job.names[0]}..{job.names[-1]}]' if job.names and len(job.names) < len(m.hit_order) else '')
             if status == 'ERROR':
-                errs += 1; probs.append(f'{where}: sby error: {err}'); continue
+                errs += 1; probs.append(f'{where}: formal tool error: {err}'); continue
             if status == 'TIMEOUT':
                 tmo += 1; probs.append(f'{where}: {err} (covers reached so far: {len(rch)})'); continue
             if m.kind == 'constraints':

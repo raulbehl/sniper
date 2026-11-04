@@ -468,7 +468,8 @@ def regress_run(work, extra=()):
     run([PY, os.path.join(ROOT, 'sniper.py'), '--own', HERE, '-o', js, '--', '--top', 'fv_regress_top',
          os.path.join(HERE, 'fv_regress_a.sv'), os.path.join(HERE, 'fv_regress_b.sv')])
     out = os.path.join(work, 'fv')
-    r = run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', out, '--max-array', '8', *extra])
+    # a relative output directory, as people run it (the jobs run in subdirectories of it)
+    r = run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--max-array', '8', *extra], cwd=work)
     return out, json.load(open(os.path.join(out, 'report.json'))), r.stdout
 
 
@@ -555,9 +556,8 @@ def test_regressions():
     return len(names), sm['covers']
 
 
-FAKE_SBY = """#!/bin/sh
+FAKE_SMTBMC = """#!/bin/sh
 # hangs like a stuck solver, with a child process: the timeout must kill both
-mkdir -p "$(basename "$2" .sby)"
 ( sleep 97 ) &
 sleep 97
 """
@@ -567,17 +567,17 @@ def test_smoke_timeout():
     work = tempfile.mkdtemp(prefix='fvtmo_')
     bindir = os.path.join(work, 'bin')
     os.makedirs(bindir)
-    with open(os.path.join(bindir, 'sby'), 'w') as f: f.write(FAKE_SBY)
-    os.chmod(os.path.join(bindir, 'sby'), 0o755)
+    with open(os.path.join(bindir, 'yosys-smtbmc'), 'w') as f: f.write(FAKE_SMTBMC)
+    os.chmod(os.path.join(bindir, 'yosys-smtbmc'), 0o755)
     env_path = os.environ['PATH']
     os.environ['PATH'] = bindir + os.pathsep + env_path
     try:
-        out, rep, stdout = regress_run(work, ['--run', '-j', '16', '--timeout', '2', '--classes', '^(bad|dup)$'])
+        out, rep, stdout = regress_run(work, ['--run', '-j', '16', '--timeout', '4', '--classes', '^(bad|dup)$'])
     finally:
         os.environ['PATH'] = env_path
     sm = rep['smoke']
     assert sm['modules'] > 0 and sm['timeouts'] == sm['modules'] and sm['errors'] == 0 and sm['unsat'] == 0
-    assert all('did not finish in 2s' in p for p in sm['problems'])
+    assert all('did not finish in 4s' in p for p in sm['problems']), sm['problems']
     left = subprocess.run(['pgrep', '-f', 'sleep 97'], capture_output=True, text=True).stdout.split()
     assert not left, f'solver processes left running: {left}'
     assert not [d for d in os.listdir(os.path.join(out, 'smoke')) if os.path.isdir(os.path.join(out, 'smoke', d))]

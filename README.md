@@ -88,7 +88,8 @@ CVA6, Caliptra and riscv-dv:
 and SymbiYosys, the flow of the `qs-ques` formal examples. It reads only sniper's JSON.
 
 ```sh
-python fvgen.py axi_uvm_tb_constructs.json -o fv/ --run      # --run: smoke-check with sby
+python fvgen.py axi_uvm_tb_constructs.json -o fv/ --run      # --run: smoke-check every module
+python fvgen.py tb.json -o fv/ --witness                     # + replay classes: hit a bin in simulation
 ```
 
 | file | content |
@@ -96,7 +97,8 @@ python fvgen.py axi_uvm_tb_constructs.json -o fv/ --run      # --run: smoke-chec
 | `fv_constraints.sv` | `fv_c_<class>`: constraint checker. Rand fields and the state the constraints read are inputs; each constraint item is a wire plus an `ASSUME(.., IMPLIES(en, ..))`. Parameters `CM_<block>` (constraint_mode), `SOFT_EN`, `INLINE_EN`. `fv_r_<class>`: `randomize()` model, anyseq values latched when `randomize` is high and constrained in that cycle; outputs hold between calls. One `fv_c_/fv_r_<class>__<site>` per `randomize()` call with inline constraints or an argument list, and per `std::randomize` |
 | `fv_covers.sv` | `fv_cg_<owner>__<cg>`: one `cover` per bin (label = bin name) under `sample && iff`; illegal bins are `ASSERT`s (``ifndef FV_NO_ILLEGAL_BINS``); transition bins are monitors over the sampled values |
 | `fv_bind.sv` | instantiation templates for covergroups declared in modules/interfaces |
-| `smoke/` | one top + `.sby` per module, all inputs free: constraints satisfiable (an unsatisfiable set is reported with a minimal conflicting core: file:line and source of each item), every implication/if guard reachable (dead constraint code otherwise), every bin reachable. `--run` runs them; job directories are removed and no traces written unless `--keep`; a job over `--timeout` is killed with its solver processes and reported as a timeout |
+| `fv_replay.sv`, `replay.json` | `--witness`: see below |
+| `smoke/` | one top + `.sby` per module, all inputs free: constraints satisfiable (an unsatisfiable set is reported with a minimal conflicting core: file:line and source of each item), every implication/if guard reachable (dead constraint code otherwise), every bin reachable. `--run` runs them (what the `.sby` does: yosys, then `yosys-smtbmc`, without the per-cover trace files sby always writes, which dominated the run time); covergroups with more than `--cover-chunk` bins are split into parallel jobs, each with only its own cover statements; job directories are removed unless `--keep`; a job over `--timeout` is killed with its solver processes and reported as a timeout |
 | `report.md/.json` | every constraint item and bin: what it became, **exact / approx / unsupported**, why, and the direction of any approximation |
 
 Constraint semantics (IEEE 1800-2017 clause 18): inheritance with same-name block override; rand
@@ -122,6 +124,32 @@ is assumed to be execution order). Classes are resolved by package when names re
 are made unique. Expressions keep SV widths: every slang `Conversion` becomes a size cast plus
 `$signed/$unsigned`; `**` is lowered (the SMT backends have no `$pow`).
 
+### Hitting a bin in simulation: `--witness`
+
+"Formal reached this bin, no regression seed hits it: how do I hit it?" A simulator seed cannot be
+derived from a formal trace (seed -> RNG -> solver is simulator-specific and not invertible), but
+the trace's field values can be forced. For every covergroup whose sampled values are fields of a
+randomized class (its own fields, a `sample(obj)` argument, or a handle field), `--witness`:
+
+1. drives the covergroup from that class's `randomize()` model, sampled the cycle after a call, and
+   only under the `if`/`case` conditions that lead to the testbench's `cg.sample(...)` calls
+   (e.g. `case (instr.instr_name) ADD: add_cg.sample(instr)`);
+2. reaches every bin and reads, from each trace, the field values of every sampled `randomize()`;
+3. writes `fv_replay.sv`: per class `<class>__fv_replay extends <class>` (factory-registered for UVM).
+   With `+FV_HIT=<covergroup module>.<cover>` its first calls pin the fields the bin depends on
+   (plus the rand fields of the sampling condition) to the witness values; everything else stays
+   random under the class's own constraints, so it works with any seed. When the sampling
+   condition reads the object's non-rand state (riscv-dv's `instr_name`, set by the generator), each
+   step waits for a call made in the witness state.
+
+Run any existing test with the override (`+uvm_set_type_override=<class>,<class>__fv_replay` or
+`set_type_override` by type for parameterized classes) and `+FV_HIT=<key>`. `replay.json` and
+`report.md` list every bin: **replay** (depends only on pinned fields), **partial** (also on values
+the class cannot set: monitor data, testbench state; listed with the witness values),
+**unreached** (no sequence of `randomize()` calls within the bound reaches it under the
+constraints: no seed will hit it). Assumptions are listed per bin (sampling conditions on other
+objects are taken as true). `--covergroups REGEX` limits the run.
+
 Coverage semantics (clause 19): value bins, `[]` (one per value) and `[N]` (values split in order,
 remainder in the last), wildcard, `with` filters, `iff`, ignore/illegal values removed from every
 other bin (fully excluded bins dropped), `default`, automatic bins (enum values, or 2^w values over
@@ -137,7 +165,11 @@ mutations of solutions, are accepted by `randomize() with` pins); **T3** compare
 transition monitor with an LRM reference model on random sample traces; **R** runs
 `tests/fv_regress_*.sv` (constructs that broke on the corpus: name collisions across packages and
 files, empty inline blocks, truncated arrays, soft priority, mode calls, `this.randomize()`, unsat
-cores, ...) through sniper, fvgen and the smoke runs, and checks a hung `sby` is killed on timeout.
+cores, ...) through sniper, fvgen and the smoke runs, and checks a hung solver is killed on timeout;
+**T4** runs `--witness` on `tests/fv_witness.sv` (class covergroup with transitions/at_least/crosses,
+a collector sampled under a `case` on a rand field and an `if` on testbench state) and replays every
+reached bin in Verilator with its real constraint solver under three seeds: each must be hit, and a
+bin formal found unreachable is never hit in 2000 plain calls.
 
 ## Notes
 
