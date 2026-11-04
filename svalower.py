@@ -471,7 +471,8 @@ def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None, ung
 
 
 def flatten_args(args, base=None):
-    """expand -f files into a flat argument list (paths made absolute)"""
+    """expand -f files into a flat argument list (paths made absolute; $VAR / ${VAR} from the
+    environment, as slang does)"""
     out, i = [], 0
     while i < len(args):
         a = args[i]
@@ -479,7 +480,7 @@ def flatten_args(args, base=None):
             fn = args[i + 1] if os.path.isabs(args[i + 1]) or base is None else os.path.join(base, args[i + 1])
             toks = []
             for line in open(fn):
-                line = line.split('//')[0].strip()
+                line = os.path.expandvars(line.split('//')[0]).strip()
                 if line: toks += line.split()
             out += flatten_args(toks, os.path.dirname(os.path.abspath(fn)))
             i += 2; continue

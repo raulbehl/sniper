@@ -27,6 +27,39 @@ so copy it there and run from the TB directory:
     +incdir+$UVM/src $UVM/src/uvm_pkg.sv -f sniper.f        # UVM: a UVM library checkout
 ```
 
+## The whole flow: `flow.py`
+
+One project file per testbench runs sniper, then fvgen (smoke runs, witness replay, the RTL run),
+and prints each command before it runs it, so any step can be rerun by hand:
+
+```sh
+export IBEX=~/work/sniper_corpus/ibex UVM=~/work/sniper_corpus/uvm-core
+python flow.py examples/ibex_icache/flow.toml -o icache_out        # --steps fvgen: reuse tb.json
+open icache_out/fv/report.md
+```
+
+```toml
+[testbench]                     # sniper: what the simulator compiles
+own  = ["${IBEX}/dv/uvm/icache/dv"]
+args = ["--single-unit", "+define+UVM", "-f", "uvm.f", "-f", "tb.f", "--top", "tb"]
+
+[fvgen]                         # any fvgen option by name
+run     = true
+witness = true
+
+[rtl]                           # optional: the keys of an --rtl-config file, or config = "x.toml"
+top       = "ibex_icache"
+filelists = ["rtl.f"]
+clock     = "clk_i"
+reset     = "rst_ni"
+reset_active_low = true
+depth     = 30
+```
+
+Paths are relative to the project file and `${VAR}` comes from the environment, also inside the `.f`
+files, so a project can sit next to (or away from) the sources it reads. Outputs: `OUT/tb.json`,
+`OUT/fv/` (`report.md`, `fv_*.sv`, `fv_replay.sv`, ...). `--dry-run` prints the commands only.
+
 ## Tests
 
 ```sh

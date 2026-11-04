@@ -7,3 +7,4 @@ examples/fv_axi/fv/
 examples/fv_axi/formal_*/
 examples/fv_axi/formal_*.sby
 examples/fv_axi/axi_uvm_tb_constructs.json
+flow_out/

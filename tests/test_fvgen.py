@@ -807,6 +807,31 @@ depth = 14
     assert sva == {'cfg_never_3_M': 'lowered', 'level_max_A': 'skipped', 'read_empty_A': 'skipped',
                    'fill_C': 'skipped', 'full_hold_A': 'skipped'}, sva
     assert info['tops'] == ['rf_dut', 'rf_bind'] and not info['multiclock']
+    # flow.py: the same run from one project file, ${VAR} from the environment (in the project file and
+    # inside the slang filelists); the same results
+    env = dict(os.environ, FVT5_SRC=HERE)
+    open(os.path.join(work, 'cfg', 'rtl_env.f'), 'w').write('${FVT5_SRC}/rtl_dut.sv\n')
+    proj = '''[testbench]
+own = ["${FVT5_SRC}"]
+args = ["--top", "rf_tb", "${FVT5_SRC}/rtl_dut.sv", "${FVT5_SRC}/rtl_tb.sv"]
+[rtl]
+top = "rf_dut"
+filelists = ["rtl_env.f"]
+binds = ["../bind.f"]
+bind_tops = ["rf_bind"]
+clock = "clk_i"
+reset = "rst_ni"
+reset_active_low = true
+depth = 14
+'''
+    open(os.path.join(work, 'cfg', 'flow.toml'), 'w').write(proj)
+    flow = [PY, os.path.join(ROOT, 'flow.py'), 'cfg/flow.toml', '-o', 'flow']
+    r = subprocess.run(flow, cwd=work, capture_output=True, text=True, env=env)
+    assert not r.returncode, r.stdout[-3000:] + r.stderr[-3000:]
+    res = lambda rp: {(x['instance'], x['covergroup'], x['cover']): (x['status'], x.get('step')) for x in rp['rtl']}
+    assert res(json.load(open(os.path.join(work, 'flow', 'fv', 'report.json')))) == res(rep)
+    r = subprocess.run(flow + ['--dry-run'], cwd=work, capture_output=True, text=True)   # FVT5_SRC unset
+    assert r.returncode and 'FVT5_SRC is not set' in r.stderr, r.stderr
     shutil.rmtree(work, ignore_errors=True)
     return len(rows)
 

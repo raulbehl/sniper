@@ -4055,7 +4055,7 @@ def report_md(rep):
                    'randomize() calls within the bound reaches it under the constraints, whatever those values are.\n')
         cnt = {}
         for r in rows: cnt[r['status']] = cnt.get(r['status'], 0) + 1
-        out.append('- ' + ', '.join(f'{k}: {v}' for k, v in sorted(cnt.items())) + '\n')
+        if cnt: out.append('- ' + ', '.join(f'{k}: {v}' for k, v in sorted(cnt.items())) + '\n')
         for name, why in rep.get('witness_skipped') or []:
             out.append(f'- covergroup `{name}`: no replay ({why})')
         for r in rows[:3000]:
@@ -4213,7 +4213,8 @@ def main():
         rows = rep['replay']
         cnt = {}
         for r in rows: cnt[r['status']] = cnt.get(r['status'], 0) + 1
-        print('witness: ' + ', '.join(f'{k} {v}' for k, v in sorted(cnt.items())) + ' -> fv_replay.sv, replay.json')
+        print('witness: ' + (', '.join(f'{k} {v}' for k, v in sorted(cnt.items())) + ' -> fv_replay.sv, replay.json'
+                             if rows else 'no covergroup samples the fields of a randomized class'))
     print(f'-> {a.out}')
 
 
