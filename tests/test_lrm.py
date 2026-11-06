@@ -10,7 +10,8 @@
        soft constraint, LRM 18.5.13). fvgen's port map (report.json) names the SV field behind each port bit.
 
     python tests/test_lrm.py      (or pytest tests/test_lrm.py)
-Needs verilator.
+Needs verilator, or the simulator named by SNIPER_REF_SIM (tests/refsim.py: vcs, xcelium, questa). Solver
+deviations from check() are reported per class (they are the reference simulator's, not fvgen's).
 """
 import json, os, random, re, shutil, subprocess, sys, tempfile
 
@@ -19,6 +20,7 @@ ROOT = os.path.dirname(HERE)
 PY = sys.executable
 sys.path.insert(0, HERE)
 from test_fvgen import DUMMY_MACROS, run      # noqa: E402
+import refsim                                  # noqa: E402
 
 
 def rel(path):
@@ -218,21 +220,19 @@ def test_constraints_lrm(seed=7, n_solve=40, n_random=150, only=None):
         tbs.append((cls, sls, atoms))
         soft_of[cls] = soft_oracle
     # one Verilator build for all classes: a top with a +CLS selector would need one module; build each
+    sim = refsim.get()
     for cls, sls, atoms in tbs:
         bd = os.path.join(out, 'b_' + cls)
-        os.makedirs(bd, exist_ok=True)
-        r = run(['verilator', '--binary', '-Wno-fatal', '-Wno-lint', '-Wno-style', '-Wno-CONSTRAINTIGN', '-I' + out,
-                 '--top-module', 'tb_' + cls, '-Mdir', bd, src, os.path.join(out, 'fv_constraints.sv'),
-                 os.path.join(out, f'tb_{cls}.sv'), '-o', 'v'], cwd=out, check=False)
+        r = sim.build([src, os.path.join(out, 'fv_constraints.sv'), os.path.join(out, f'tb_{cls}.sv')], 'tb_' + cls,
+                      bd, incdirs=[out])
         if r.returncode:
-            failures.append((cls, 'verilator build failed: ' + r.stderr[-1500:])); continue
-        exe = os.path.join(bd, 'v')
+            failures.append((cls, f'{sim.name} build failed: ' + (r.stderr or r.stdout)[-1500:])); continue
         smax = {s.port: 3 for s in sls if s.is_size}
         # 1. solver solutions under random state
         tup = [norm(sls, tuple_random(sls, rng, smax)) for _ in range(n_solve)]
         with open(os.path.join(out, f'{cls}.tup'), 'w') as f:
             for t in tup: f.write(' '.join(map(str, t)) + '\n')
-        r = run([exe, '+MODE=solve', f'+verilator+seed+{seed}'], cwd=out)
+        r = sim.run(bd, out, ['+MODE=solve'], seed)
         sols, solve_bad, soft_drop = [], [], []
         names = [s.path for s in sls]
         for line in r.stdout.splitlines():
@@ -270,7 +270,7 @@ def test_constraints_lrm(seed=7, n_solve=40, n_random=150, only=None):
         tup += [norm(sls, tuple_random(sls, rng, smax)) for _ in range(n_random)]
         with open(os.path.join(out, f'{cls}.tup'), 'w') as f:
             for t in tup: f.write(' '.join(map(str, t)) + '\n')
-        r = run([exe, '+MODE=check', f'+verilator+seed+{seed}'], cwd=out)
+        r = sim.run(bd, out, ['+MODE=check'], seed)
         n = acc_n = 0
         diffs, sdev = [], []
         for line in r.stdout.splitlines():
@@ -296,6 +296,12 @@ def test_constraints_lrm(seed=7, n_solve=40, n_random=150, only=None):
     return results, unsup, failures, deviations, work
 
 
+def test_l18():
+    res, unsup, fails, devs, work = test_constraints_lrm()
+    assert not fails, fails
+    assert not unsup, unsup
+
+
 if __name__ == '__main__':
     only = sys.argv[1] if len(sys.argv) > 1 else None
     res, unsup, fails, devs, work = test_constraints_lrm(only=only)
@@ -303,6 +309,7 @@ if __name__ == '__main__':
         print(f'  {c:40s} {n:4d} tuples ({a} accepted), {s} solutions')
     for u in unsup: print('UNSUPPORTED', u)
     seen = {}
+    print(f'reference simulator: {refsim.NAME}')
     for d in devs: seen.setdefault((d[0], d[1].split(' (')[0] if 'solution violates' in d[1] else d[1]), []).append(d[2])
     for (c, what), ex in seen.items(): print(f'VERILATOR {c}: {what}' + (f' x{len(ex)}' if len(ex) > 1 else '') + f'; e.g. {str(ex[0])[:200]}')
     for c, f in fails: print('FAIL', c, f)
