@@ -2789,6 +2789,7 @@ class CoverGen:
                 cond = '!(' + ' || '.join(others) + ')' if others else "1'b1"
                 lo_t, hi_t = self.tmin_max(cpinfo)
                 known = all(x.values is not None for x in cpinfo['bins']) and w <= 16
+                rest = None
                 left = known and any(v not in excl_vals and not any(lo <= v <= hi for x in cpinfo['bins']
                                                                      for lo, hi in x.values)
                                      for v in range(lo_t, hi_t + 1))
@@ -2799,9 +2800,20 @@ class CoverGen:
                     ent['notes'] = ['illegal default bin: an assertion (a value in no other bin is an error)']
                 elif b['kind'] == 'IgnoreBins':
                     ent['notes'] = ['ignore default bin: values in no other bin are ignored; no cover']
+                elif b.get('array') and known and \
+                        len(rest := [v for v in range(lo_t, hi_t + 1) if v not in excl_vals and not any(
+                            lo <= v <= hi for x in cpinfo['bins'] for lo, hi in x.values)]) <= self.gen.a.max_bins:
+                    # bins others[] = default: one bin per value in no other bin (LRM 19.5.1)
+                    for v in rest:
+                        self.cover(f"{cp['name']}__{b['name']}__{v if v >= 0 else 'm' + str(-v)}",
+                                   f"{iff} && ({cpinfo['v']} == {lit(v, w, sg)})", ent, at_least)
+                    ent['notes'] = [f'default bin array: {len(rest)} bins, one per value in no other bin; informational '
+                                    '(not part of coverage, LRM 19.5)']
                 else:
                     self.cover(f"{cp['name']}__{b['name']}", f'{iff} && {cond}', ent, at_least)
-                    ent['notes'] = ['default bin: values in no other bin; informational (not part of coverage, LRM 19.5)']
+                    ent['notes'] = ['default bin: values in no other bin; informational (not part of coverage, LRM 19.5)'] + \
+                        ([f'an array of default bins is one cover here (more than --max-bins values or the value sets '
+                          'are not constant)'] if b.get('array') else [])
             self.entries.append(ent)
         return cpinfo
 
@@ -2953,8 +2965,10 @@ class CoverGen:
             ent['notes'].append('no value left: the bin is empty and not created (LRM 19.5.7)')
             return
         if not b['array']:
-            c, _ = self.bin_set(cp, cpinfo, b)
-            emit_bin(ident(b['name']), c, ent)
+            c, vals = self.bin_set(cp, cpinfo, b)
+            # its value set (binsof ... intersect, default bins): intervals when no `with` filters it
+            ivs = self.intervals(cpinfo, items, wild) if b.get('withExpr') is None else None
+            emit_bin(ident(b['name']), c, ent, ivs if ivs is not None else vals)
             return
         if nbins is not None and b.get('withExpr') is None:
             ivs = self.intervals(cpinfo, items, wild)

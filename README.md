@@ -73,6 +73,39 @@ bins/crosses, assertions, randomization sites, stimulus map, config overrides an
 from constraints, `constraint_mode`/`rand_mode` calls), `probe_invalid.sv` code slang cannot bind.
 Every extraction bug found on the corpus gets an assertion there.
 
+### LRM conformance: `tests/test_lrm.py`
+
+```sh
+python tests/test_lrm.py            # clause 18: constraints
+python tests/test_lrm.py 19         # clause 19: coverage
+SNIPER_REF_SIM=vcs python tests/test_lrm.py      # reference simulator: verilator (default) | vcs | xcelium | questa
+```
+
+- **Clause 18** (`tests/lrm_constraints.sv`): one class per construct (expressions and widths, implication,
+  if/else, inside, dist, unique, foreach incl. skipped dimensions, dynamic / nested dynamic / associative
+  arrays, arrays of objects and structs, reductions, `item.index`, `find().size()`, functions with locals /
+  case / loops, inheritance, extern / pure constraints, nested rand objects, enums, unpacked struct members,
+  guards on state and null handles, system functions, `solve before`, static constraints, soft priorities,
+  `disable soft`, inline `with` and `local::`, `randomize(a)`, `rand_mode` / `constraint_mode`). Every class
+  has `check()`: the LRM meaning of its constraints in plain procedural SV. For value tuples (the solver's
+  solutions, their one-field mutations, random tuples) fvgen's checker must agree with `check()`; the
+  reference simulator's solver is compared too, and its deviations from `check()` are listed (Verilator 5.052
+  deviates on unique, enum domains, dist, find, element-class constraints, unpacked struct members, variable
+  bit-selects, function locals, associative keys).
+- **Clause 19** (`tests/lrm_coverage.sv`): the worked examples of 1800-2023 as written (19.5.1 bins and fixed
+  arrays, default arrays, 19.5.1.1 `with`, 19.5.2 transitions on the LRM's sample traces, 19.5.3 automatic
+  bins, 19.5.4 wildcards, 19.5.5/19.5.6 ignore/illegal, 19.5.7 value resolution, 19.6 crosses and select
+  expressions, iff). fvgen's covers are driven with every value / the traces / value pairs and compared with
+  the bins the text states. `L19_KNOWN` lists where fvgen deliberately differs from the text, with the reason
+  (one today: `[=]` followed by a value, where the example's count disagrees with the meaning of `[=]` in
+  sequences; reachability is the same).
+- `tests/refsim.py`: the reference simulator backends. The commercial ones follow the tools' documented
+  command lines and have not been run yet.
+
+Not modelled (reported as unsupported): real-valued coverpoints and tolerance ranges (no real arithmetic in
+the formal model), `default sequence` bins (outside coverage per the LRM), cross bins from functions
+returning `CrossQueueType`.
+
 ## Output
 
 | key | content |
