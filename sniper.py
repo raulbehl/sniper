@@ -233,10 +233,17 @@ def type_info(t, depth=0):
     if depth > 4: return ti
     if ct.isStruct or k in ('PackedUnionType', 'UnpackedUnionType'):
         ti['fields'] = [{'name': f.name, 'offset': f.bitOffset if t.isIntegral else None,
-                         'type': type_info(f.type, depth + 1)} for f in ct if f.kind.name == 'Field']
+                         'type': type_info(f.type, depth + 1),
+                         'rand': enum_name(f.randMode) if enum_name(f.randMode) != 'None_' else None}
+                        for f in ct if f.kind.name == 'Field']
     elif ct.isUnpackedArray or ct.isQueue or ct.isAssociativeArray:
         try: ti['elem'] = type_info(ct.arrayElementType, depth + 1)
         except Exception: pass
+        if ct.isAssociativeArray:
+            try:
+                it = ct.associativeIndexType
+                ti['index'] = type_info(it, depth + 1) if it is not None else {'kind': 'wildcard'}
+            except Exception: pass
         if ct.hasFixedRange:
             r = ct.fixedRange
             ti['range'] = [r.left, r.right]
@@ -292,6 +299,9 @@ class Ser:
             try:
                 t = n.type
                 out['ty'] = str(t)
+                ct = t.canonicalType
+                if ct.isClass and str(ct) != out['ty']:
+                    out['cty'] = str(ct)        # the class a typedef / type parameter names
                 if t.isIntegral: out['w'], out['signed'] = t.bitWidth, bool(t.isSigned)
             except Exception: pass
             if n.kind.name == 'MemberAccess':
@@ -311,6 +321,13 @@ class Ser:
                     if n.symbol.kind.name in ('EnumValue', 'Parameter'): c = str(n.symbol.value)
                 except Exception: pass
             if c is not None: out['const'] = c
+        if n.kind.name == 'VariableDeclaration':     # a local: its type and initializer (function inlining)
+            try:
+                vt = n.symbol.type
+                if vt.isIntegral: out['w'], out['signed'] = vt.bitWidth, bool(vt.isSigned)
+                out['ty'] = str(vt)
+                if n.symbol.initializer is not None: out['init'] = self._node(n.symbol.initializer, False, seen)
+            except Exception: pass
         for a in sorted(set(dir(type(n))) - BASE_ATTRS[base] - SKIP):
             if a.startswith('_') or a[0].isupper(): continue
             try: v = getattr(n, a)
@@ -527,10 +544,16 @@ def analyse(body, loc, ser):
                 facts['rand_sites'].append({'kind': 'syscall', 'name': name, 'line': c['line'], 'src': text(x),
                                             'args': [text(a) for a in x.arguments]})
             elif name == 'randomize':
-                # slang treats both forms as built-ins, so classify by how the call is written
+                # slang treats both forms as built-ins, so classify by how the call is written: the
+                # invocation's callee (the call's text can carry an enclosing cast's or macro's parentheses)
                 src = text(x)
-                if src.startswith('std::'): rk, tgt = 'std::randomize', None
-                elif '.randomize' in src.split('(')[0]: rk, tgt = 'randomize', src.split('.randomize')[0]
+                syn = x.syntax
+                while syn is not None and syn.kind.name == 'ParenthesizedExpression': syn = syn.expression
+                if syn is not None and syn.kind.name == 'ArrayOrRandomizeMethodExpression': syn = syn.method   # with {..}
+                callee = syn.left if syn is not None and syn.kind.name == 'InvocationExpression' else syn
+                callee = ' '.join(str(callee).split()) if callee is not None else src.split('(')[0]
+                if callee.startswith('std::'): rk, tgt = 'std::randomize', None
+                elif callee.endswith('.randomize'): rk, tgt = 'randomize', callee[:-len('.randomize')]
                 else: rk, tgt = 'randomize', 'this'
                 facts['rand_sites'].append({'kind': rk, 'target': tgt,
                                             'line': c['line'], 'src': text(x), 'ast': ser.node(x)})

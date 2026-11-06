@@ -167,6 +167,8 @@ class Arr:
         self.name, self.dims, self.ew, self.esigned, self.role, self.origin = name, dims, ew, esigned, role, origin
         self.ti, self.size_var, self.enum = ti or {}, size_var, enum
         self.trunc = False     # dynamic array whose size() can exceed the modelled maximum
+        self.dsize = {}        # depth > 0 -> Arr of the sizes of that dynamic dimension, per outer position
+        self.dtrunc = set()    # inner dynamic depths modelled at --max-array (their size() can exceed it)
 
     @property
     def n(self):
@@ -191,6 +193,39 @@ class Obj:
         self.kids = {}
 
 
+class ObjArr(Obj):
+    """An unpacked array of class objects / unpacked structs: one Obj per flat position (kids '0',
+    '1', ..), plus the size variable of a dynamic first dimension (kid '__size'). Indexed like Arr."""
+    def __init__(self, name, dims, role, origin, size_var=None):
+        super().__init__(None, name + '__', role, origin)
+        self.name, self.dims, self.size_var = name, dims, size_var
+        self.trunc, self.dsize, self.dtrunc, self.enum = False, {}, set(), None
+        if size_var is not None: self.kids['__size'] = size_var
+
+    @property
+    def n(self):
+        return math.prod(abs(a - b) + 1 for a, b in self.dims)
+
+
+class Assoc(Obj):
+    """An associative array (LRM 18.4: its size and keys are not randomizable). Elements read with a
+    constant key are kids 'k:<key>'; `foreach` also covers `slots` symbolic entries whose key and
+    presence are state (the keys the array holds when randomize() is called)."""
+    def __init__(self, name, role, origin, index_ti):
+        super().__init__(None, name + '__', role, origin)
+        self.name, self.index_ti = name, index_ti
+        self.keys = {}          # key text -> (key value or None for strings, element)
+        self.slots = []         # (key Var or None, valid Var, element)
+
+
+NULL = object()      # the null literal (only compared with handles)
+
+
+class AssocRef:
+    def __init__(self, assoc):
+        self.assoc = assoc
+
+
 # ======================================================================== typed expressions
 class S:
     """translated scalar: Verilog text, width, signedness; k = constant value when known;
@@ -202,9 +237,10 @@ class S:
 
 
 class ARef:
-    """a (sub)array: arr with the leading `fixed` dimensions already indexed (flat offset text)"""
-    def __init__(self, arr, depth=0, off='0', guard=None):
-        self.arr, self.depth, self.off, self.guard = arr, depth, off, guard
+    """a (sub)array: arr with the leading `depth` dimensions already indexed (flat element offset
+    text; pos = flat position over the indexed dimensions, for the sizes of inner dynamic ones)"""
+    def __init__(self, arr, depth=0, off='0', guard=None, pos='0'):
+        self.arr, self.depth, self.off, self.guard, self.pos = arr, depth, off, guard, pos
 
 
 class ORef:
@@ -260,6 +296,7 @@ class Tx:
         self.refs = set()      # model variables referenced by the current atom
         self.notes = []        # approximations met while translating the current atom
         self.trunc = set()     # truncated arrays the current atom reads beyond fixed positions
+        self.trunc_extra = set()   # conditions under which an inner dynamic array read is past its model
         self.depth = 0
         self.this_stack = []   # (class name, ORef) of methods being inlined
 
@@ -346,6 +383,7 @@ class Tx:
     def x_ElementSelect(self, n):
         base = self.ex(n['value'])
         if isinstance(base, ARef): return self.arr_index(base, n['selector'], n)
+        if isinstance(base, AssocRef): return self.assoc_index(base, n['selector'])
         if isinstance(base, S):                     # packed select: bit, or element of multi-dim packed
             w, s = self.width(n)
             dims = ty_packed_dims(n['value'].get('ty'))
@@ -397,13 +435,38 @@ class Tx:
 
     def start(self):
         """begin translating a new atom"""
-        self.refs, self.notes, self.trunc = set(), [], set()
+        self.refs, self.notes, self.trunc, self.trunc_extra = set(), [], set(), set()
 
     def trunc_cond(self):
         """true when a truncated array read by the current atom has elements past the model: the
         atom is then not modelled and must not constrain anything (approx: over)"""
-        return ' || '.join(f'({a.size_var.name} > {lit(a.max, 32, True)})'
-                           for a in sorted(self.trunc, key=lambda a: a.name))
+        return ' || '.join([f'({a.size_var.name} > {lit(a.max, 32, True)})'
+                            for a in sorted(self.trunc, key=lambda a: a.name)] + sorted(self.trunc_extra))
+
+    def elem_ref(self, x):
+        """an element of an array of objects / an associative array as a translated value"""
+        if isinstance(x, Var):
+            self.refs.add(x.name)
+            return S(x.name, x.w, x.signed, None, not x.signed)
+        if isinstance(x, Arr):
+            self.refs.add(x.name); return ARef(x)
+        if isinstance(x, ObjArr): return ARef(x)
+        if isinstance(x, Assoc): return AssocRef(x)
+        return ORef(x)
+
+    def dyn_size(self, arr, depth, pos):
+        """the size of dimension `depth` (dynamic) at outer flat position pos (text or int), or None"""
+        if depth == 0:
+            if arr.size_var is None: return None
+            self.refs.add(arr.size_var.name)
+            return S(arr.size_var.name, 32, True, None, True)
+        sa = arr.dsize.get(depth)
+        if sa is None: return None
+        self.refs.add(sa.name)
+        try: pk = eval_int(str(pos))
+        except Exception: pk = None
+        if pk is not None: return S(f'{sa.name}[{pk * 32} +: 32]', 32, True)
+        return S(f'{sa.name}[({pos}) * 32 +: 32]', 32, True)
 
     def arr_index(self, a, seln, n):
         arr = a.arr
@@ -413,42 +476,85 @@ class Tx:
         lo = min(dl, dr)
         size = abs(dl - dr) + 1
         guard = a.guard
+        dsz = self.dyn_size(arr, a.depth, a.pos)
         if sel.k is not None:
             p = sel.k.v - lo
-            if not 0 <= p < size: raise Unsupported(f'constant index {sel.k.v} outside {arr.origin}')
+            if not 0 <= p < size:
+                if dsz is not None and a.depth > 0 and p >= size:
+                    raise Unsupported(f'index {sel.k.v} past the modelled inner dimension of {arr.origin} (raise --max-array)')
+                raise Unsupported(f'constant index {sel.k.v} outside {arr.origin}')
             off = f'({a.off}) + {p * inner}' if a.off != '0' else str(p * inner)
-            if a.depth == 0 and arr.size_var is not None:
-                g = f'({lit(sel.k.v, 32, True)} < {arr.size_var.name})'
-                self.refs.add(arr.size_var.name)
+            pos = f'({a.pos}) * {size} + {p}' if a.pos != '0' else str(p)
+            if dsz is not None:
+                g = f'({lit(sel.k.v, 32, True)} < {dsz.t})'
                 guard = g if guard is None else f'({guard} && {g})'
         else:
             st = self.cast(sel, 32, True).t
-            p = f'({st} - {lit(lo, 32, True)})'
-            off = f'({a.off}) + {p} * {inner}' if a.off != '0' else f'{p} * {inner}'
-            lim = arr.size_var.name if (a.depth == 0 and arr.size_var is not None) else lit(size, 32, True)
-            if a.depth == 0 and arr.size_var is not None:
-                self.refs.add(arr.size_var.name)
-                if arr.trunc:
-                    self.trunc.add(arr); self.refs.add(arr.size_var.name)
+            pv = f'({st} - {lit(lo, 32, True)})'
+            off = f'({a.off}) + {pv} * {inner}' if a.off != '0' else f'{pv} * {inner}'
+            pos = f'({a.pos}) * {size} + {pv}' if a.pos != '0' else pv
+            lim = lit(size, 32, True)
+            if dsz is not None:
+                lim = dsz.t
+                if a.depth == 0 and arr.trunc:
+                    self.trunc.add(arr)
                     lim = f'(({lim}) < {lit(arr.max, 32, True)} ? ({lim}) : {lit(arr.max, 32, True)})'
-            g = f'({p} >= 0 && {p} < {lim})'
+                elif a.depth > 0:
+                    lim = f'(({lim}) < {lit(size, 32, True)} ? ({lim}) : {lit(size, 32, True)})'
+            g = f'({pv} >= 0 && {pv} < {lim})'
             guard = g if guard is None else f'({guard} && {g})'
         if a.depth + 1 < len(arr.dims):
-            return ARef(arr, a.depth + 1, off, guard)
-        w, s = arr.ew, arr.esigned
+            return ARef(arr, a.depth + 1, off, guard, pos)
         try: offk = eval_int(off)
         except Exception: offk = None
+        if isinstance(arr, ObjArr):
+            if offk is None: raise Unsupported(f'variable index into an array of objects/structs ({arr.origin})')
+            return self.elem_ref(arr.kids[str(offk)])
+        w, s = arr.ew, arr.esigned
         t = f'{arr.name}[{offk * w} +: {w}]' if offk is not None else f'{arr.name}[({off}) * {w} +: {w}]'
         if w == 1 and offk is not None: t = f'{arr.name}[{offk}]'
         if s: t = f'$signed({t})'
         if guard is not None:           # out-of-range reads return the default value (0), LRM 7.4.6
-            if offk is None or a.guard is not None:
+            if offk is None or a.guard is not None or dsz is not None and a.depth > 0:
                 t = f'(({guard}) ? {t} : {lit(0, w, s)})'
                 return S(t, w, s)
         return S(t, w, s, None, not s and guard is None)
 
+    def assoc_index(self, a, seln):
+        sel = strip_conv(seln)
+        cur = self.env.get('#assoc:' + a.assoc.name)
+        if cur is not None and sel.get('k') == 'NamedValue' and (sel.get('symbol') or {}).get('skind') == 'Iterator':
+            e = a.assoc.keys[cur][1] if isinstance(cur, str) else a.assoc.slots[cur][2]
+            return self.elem_ref(e)
+        if 'const' not in sel and 'const' not in seln:
+            raise Unsupported('associative array read with a non-constant key')
+        c = seln.get('const', sel.get('const'))
+        key = c if str(c).startswith('"') else str(parse_const(c).v)
+        if key not in a.assoc.keys: raise Unsupported(f'associative array key {key} not collected')
+        return self.elem_ref(a.assoc.keys[key][1])
+
+    def x_NullLiteral(self, n):
+        return NULL
+
+    def null_flag(self, o):
+        """the 'handle is null' state of an object (18.5.12 guards compare handles with null)"""
+        if not isinstance(o, ORef): raise Unsupported('null compared with a non-handle')
+        obj = o.obj
+        v = obj.kids.get('__null')
+        if v is None:
+            v = Var(ident(obj.prefix + 'null'), 1, False, 'state', obj.origin)
+            v.arr_kind = 'NullFlag'
+            obj.kids['__null'] = v
+        self.refs.add(v.name)
+        return S(v.name, 1, False, None, True)
+
     def x_BinaryOp(self, n):
         op = n['op']
+        if op in ('Equality', 'Inequality', 'CaseEquality', 'CaseInequality') and \
+                'NullLiteral' in (strip_conv(n['left']).get('k'), strip_conv(n['right']).get('k')):
+            side = n['right'] if strip_conv(n['left']).get('k') == 'NullLiteral' else n['left']
+            f = self.null_flag(self.ex(side))
+            return f if op in ('Equality', 'CaseEquality') else S(f'(!{f.t})', 1, False)
         w, s = self.width(n)
         if op in ('WildcardEquality', 'WildcardInequality'):
             l, r = self.scalar(n['left']), self.scalar(n['right'])
@@ -592,23 +698,32 @@ class Tx:
         R = self.cast(R, L.w, L.s) if R.w != L.w else R
         return [f'({L.t} == {R.t})']
 
-    def elements(self, a):
-        """(element S, guard text or None) for every element of an (sub)array"""
+    def elements(self, a, with_index=False):
+        """(element S, guard text or None[, index]) for every element of an (sub)array"""
         arr = a.arr
+        if isinstance(arr, ObjArr): raise Unsupported(f'array of objects/structs used as values ({arr.origin})')
         dims = arr.dims[a.depth:]
         out = []
         if arr.trunc and a.depth == 0: self.trunc.add(arr)
         for idx in iter_dims(dims):
             x = a
-            g = None
             for d, i in enumerate(idx):
                 lo = min(arr.dims[a.depth + d])
                 x = self.arr_index(x, {'k': 'IntegerLiteral', 'const': str(i + lo), 'w': 32, 'signed': True}, None)
             if isinstance(x, S):
+                g = None
+                if x.t.startswith('(('):
+                    m = re.match(r'^\(\((.*)\) \? (.*) : [^:]*\)$', x.t)
+                    if m: g, x = m.group(1), S(m.group(2), x.w, x.s)
                 if arr.size_var is not None and a.depth == 0:
-                    g = f'({lit(idx[0] + min(arr.dims[0]), 32, True)} < {arr.size_var.name})'
-                    x = S(x.t.split(' ? ')[1].split(' : ')[0] if x.t.startswith('((') else x.t, x.w, x.s)
-                out.append((x, g))
+                    g0 = f'({lit(idx[0] + min(arr.dims[0]), 32, True)} < {arr.size_var.name})'
+                    self.refs.add(arr.size_var.name)
+                    g = g0 if g is None else f'({g0} && {g})'
+                out.append((x, g, idx[0] + min(arr.dims[a.depth])) if with_index else (x, g))
+        for d in arr.dsize:              # a whole inner array past its model: the atom does not hold
+            if d >= a.depth and d in arr.dtrunc:
+                sa = arr.dsize[d]
+                self.trunc_extra.add(f'(|{{{", ".join(f"({sa.name}[{p * 32} +: 32] > {lit(sa.max, 32, True)})" for p in range(sa.dims[0][1] + 1))}}})')
         return out
 
     def x_Dist(self, n):
@@ -633,14 +748,26 @@ class Tx:
             info = (n.get('subroutine') or {})
             extra = info.get('extraInfo') or {}
             if name in ('size', 'num'):
+                inner = strip_conv(args[0])
+                if inner.get('k') == 'Call' and inner.get('subroutineName') in ('find', 'find_index'):
+                    return self.cast(self.locator_count(inner), *self.width(n))
                 a = self.ex(args[0])
+                if isinstance(a, AssocRef):
+                    terms = [lit(1, 32, True)] * len(a.assoc.keys)
+                    for kv, vv, e in a.assoc.slots:
+                        self.refs.add(vv.name); terms.append(f"{{31'd0, {vv.name}}}")
+                    return self.cast(S('(' + ' + '.join(terms) + ')' if terms else lit(0, 32, True), 32, True), *self.width(n))
                 if not isinstance(a, ARef): raise Unsupported(f'{name}() of a non-array')
                 arr = a.arr
-                if a.depth == 0 and arr.size_var is not None:
-                    self.refs.add(arr.size_var.name)
-                    return self.cast(S(arr.size_var.name, 32, True, None, True), *self.width(n))
+                dsz = self.dyn_size(arr, a.depth, a.pos)
+                if dsz is not None:
+                    return self.cast(dsz, *self.width(n))
                 l, r = arr.dims[a.depth]
                 return S(lit(abs(l - r) + 1, *self.width(n)), *self.width(n), K(abs(l - r) + 1, 32, True))
+            if name == 'index':        # item.index in an array method's with clause
+                b = self.env.get('#index')
+                if b is None: raise Unsupported('item.index outside an array method')
+                return self.cast(b, *self.width(n))
             if name in ('sum', 'product', 'and', 'or', 'xor'):
                 return self.reduce(n, name, args, extra)
             if name in ('$countones', '$onehot', '$onehot0'):
@@ -655,6 +782,29 @@ class Tx:
                 return self.cast(x, w, s)
             if name == '$isunknown':
                 return S("1'b0", 1, False, K(0, 1))
+            if name == '$countbits':        # 20.9: bits equal to any control value; 2-state: x/z never match
+                x = self.scalar(args[0]); w, s = self.width(n)
+                ctl = set()
+                for c in args[1:]:
+                    k = nconst(c) or nconst(strip_conv(c))
+                    if k is None: raise Unsupported('$countbits control value not constant')
+                    ctl.add('x' if k.x else str(k.v & 1))
+                cw = max(1, x.w.bit_length())
+                ones = S(f'$countones({x.t})', cw, False)
+                if {'0', '1'} <= ctl: return S(lit(x.w, w, s), w, s, K(x.w, w, s))
+                if '1' in ctl: return self.cast(ones, w, s)
+                if '0' in ctl: return self.cast(S(f"({lit(x.w, cw, False)} - $countones({x.t}))", cw, False), w, s)
+                return S(lit(0, w, s), w, s, K(0, w, s))
+            if name == '$clog2':            # 20.8.1: ceiling of log2; 0 for 0 and 1
+                x = self.scalar(args[0]); w, s = self.width(n)
+                if x.k is not None:
+                    v = max(0, (x.k.v - 1).bit_length())
+                    return S(lit(v, w, s), w, s, K(v, w, s))
+                b = self.temp(self.cast(x, x.w, False))
+                t = lit(x.w, w, s)
+                for i in range(x.w - 1, -1, -1):        # x <= 2**i -> i, from the top down
+                    t = f"(({b.t} <= {lit(1 << i, x.w + 1, False)}) ? {lit(i, w, s)} : {t})"
+                return S(t, w, s)
             raise Unsupported(f'system call {name}')
         return self.inline_call(n, name, args)
 
@@ -667,20 +817,46 @@ class Tx:
         ident_v = {'sum': 0, 'product': 1, 'and': -1, 'or': 0, 'xor': 0}[name]
         op = {'sum': '+', 'product': '*', 'and': '&', 'or': '|', 'xor': '^'}[name]
         terms = []
-        for e, g in self.elements(a):
+        for e, g, ix in self.elements(a, True):
             if it_expr is not None:
-                saved = self.env.get(it_var)
+                saved, saved_ix = self.env.get(it_var), self.env.get('#index')
                 self.env[it_var] = e
+                self.env['#index'] = S(lit(ix, 32, True), 32, True, K(ix, 32, True))
                 try: t = self.scalar(it_expr)
                 finally:
                     if saved is None: self.env.pop(it_var, None)
                     else: self.env[it_var] = saved
+                    if saved_ix is None: self.env.pop('#index', None)
+                    else: self.env['#index'] = saved_ix
             else:
                 t = e
             t = self.cast(t, w, s)
             terms.append(f'({g} ? {t.t} : {lit(ident_v, w, s)})' if g else t.t)
         if not terms: return S(lit(ident_v, w, s), w, s, K(ident_v, w, s))
         return S('(' + f' {op} '.join(terms) + ')', w, s)
+
+    def locator_count(self, n):
+        """arr.find(x) with (cond).size(): the number of elements satisfying cond"""
+        extra = ((n.get('subroutine') or {}).get('extraInfo') or {})
+        it_expr = extra.get('iterExpr')
+        it_var = (extra.get('iterVar') or {}).get('path')
+        if it_expr is None: raise Unsupported('find() without a with clause')
+        a = self.ex(n['arguments'][0])
+        if not isinstance(a, ARef): raise Unsupported('find() of a non-array')
+        terms = []
+        for e, g, ix in self.elements(a, True):
+            saved, saved_ix = self.env.get(it_var), self.env.get('#index')
+            self.env[it_var] = e
+            self.env['#index'] = S(lit(ix, 32, True), 32, True, K(ix, 32, True))
+            try: c = self.boolean(self.scalar(it_expr))
+            finally:
+                if saved is None: self.env.pop(it_var, None)
+                else: self.env[it_var] = saved
+                if saved_ix is None: self.env.pop('#index', None)
+                else: self.env['#index'] = saved_ix
+            if g: c = b_and(S(f'({g})', 1, False), c)
+            terms.append(f"{{31'd0, {c.t}}}" if c.k is None else lit(c.k.v, 32, True))
+        return S('(' + ' + '.join(terms) + ')' if terms else lit(0, 32, True), 32, True)
 
     def inline_call(self, n, name, args):
         """a user function whose body is a single `return <expr>;`: substitute the arguments"""
@@ -704,7 +880,7 @@ class Tx:
                 else:
                     raise Unsupported(f'{name}(): argument {f["name"]} has no value')
             self.depth += 1
-            r = self.ex(body)
+            r = self.exec_body(body['body'], n, sub_path) if body.get('k') == '#body' else self.ex(body)
             self.notes.append(f'function {name}() inlined (statically resolved; a virtual override in a '
                               'derived class would replace it)')
             return r
@@ -712,6 +888,150 @@ class Tx:
             self.depth -= 1
             self.env = saved
             self.this_stack.pop()
+
+    # ---- function bodies: locals, if/else, case, early return, constant-bound loops
+    LOOP_MAX = 256
+
+    def exec_body(self, body, call, sub_path):
+        rw, rs = self.width(call)
+        st = FnState(S(lit(0, rw, rs), rw, rs, K(0, rw, rs)), FALSE)
+        self.fn_ret = (sub_path + '.' + sub_path.rsplit('::', 1)[-1].rsplit('.', 1)[-1], rw, rs)  # F = v;
+        self.env[self.fn_ret[0]] = st.ret
+        self.run(body, TRUE, st)
+        return mux(st.done, st.ret, self.env[self.fn_ret[0]]) if st.done.k is None or st.done.k.v else \
+            self.env[self.fn_ret[0]]
+
+    def assign(self, lhs, val, pc, st):
+        lhs = strip_conv(lhs)
+        if lhs.get('k') != 'NamedValue': raise Unsupported(f'function body: assignment to {lhs.get("src") or lhs.get("k")}')
+        path = lhs['symbol'].get('path')
+        old = self.env.get(path)
+        if not isinstance(old, S): raise Unsupported(f'function body: assignment to non-local {lhs["symbol"]["sym"]}')
+        val = self.cast(val, old.w, old.s)
+        self.env[path] = mux(b_and(pc, b_not(st.done)), val, old)
+
+    def step_expr(self, e, pc, st):
+        """an expression statement: assignment (plain or compound) or ++/--"""
+        e = strip_conv(e)
+        k = e.get('k')
+        if k == 'Assignment':
+            if e.get('isNonBlocking'): raise Unsupported('function body: nonblocking assignment')
+            lhs = strip_conv(e['left'])
+            if lhs.get('k') == 'NamedValue':
+                self.env['#lvalue'] = self.env.get(lhs['symbol'].get('path'))
+            self.assign(e['left'], self.scalar(e['right']), pc, st)
+            return
+        if k == 'UnaryOp' and e['op'] in ('Preincrement', 'Postincrement', 'Predecrement', 'Postdecrement'):
+            x = self.scalar(e['operand'])
+            d = 1 if 'increment' in e['op'] else -1
+            one = S(lit(1, x.w, x.s), x.w, x.s, K(1, x.w, x.s))
+            v = fold_bin('Add' if d > 0 else 'Subtract', x, one, x.w, x.s) or S(f"({x.t} {'+' if d > 0 else '-'} {one.t})", x.w, x.s)
+            self.assign(e['operand'], v, pc, st)
+            return
+        if k == 'Call' and not e.get('isSystemCall') is False:
+            raise Unsupported(f'function body: call statement {e.get("src", "")}')
+        raise Unsupported(f'function body: statement {k}')
+
+    def x_LValueReference(self, n):
+        v = self.env.get('#lvalue')
+        if v is None: raise Unsupported('compound assignment target')
+        return v
+
+    def run(self, n, pc, st):
+        if n is None or (pc.k is not None and not pc.k.v): return
+        k = n.get('k')
+        if k == 'List':
+            for x in n.get('list') or []: self.run(x, pc, st)
+        elif k == 'Block':
+            self.run(n.get('body'), pc, st)
+        elif k in ('Empty', None):
+            pass
+        elif k == 'VariableDeclaration':
+            w, s = self.width(n)
+            init = self.cast(self.scalar(n['init']), w, s) if n.get('init') else S(lit(0, w, s), w, s, K(0, w, s))
+            self.env[n['symbol']['path']] = init
+        elif k == 'ExpressionStatement':
+            self.step_expr(n['expr'], pc, st)
+        elif k == 'Return':
+            if n.get('expr') is not None:
+                _, rw, rs = self.fn_ret
+                v = self.cast(self.scalar(n['expr']), rw, rs)
+                st.ret = mux(b_and(pc, b_not(st.done)), v, st.ret)
+            st.done = b_or(st.done, pc)
+        elif k == 'Conditional':
+            conds = n.get('conditions') or []
+            if len(conds) != 1 or 'pattern' in (conds[0] or {}): raise Unsupported('function body: if with a pattern')
+            c = self.boolean(self.scalar(conds[0]['expr']))
+            self.run(n.get('ifTrue'), b_and(pc, c), st)
+            self.run(n.get('ifFalse'), b_and(pc, b_not(c)), st)
+        elif k == 'Case':
+            if n.get('condition') not in (None, 'Normal'): raise Unsupported(f"function body: case{n['condition'].lower()}")
+            sel = self.scalar(n['expr'])
+            prev = FALSE
+            for it in n.get('items') or []:
+                m = FALSE
+                for e in it.get('expressions') or []:
+                    v = self.cast(self.scalar(e), sel.w, sel.s)
+                    m = b_or(m, fold_bin('Equality', sel, v, 1, False) or S(f'({sel.t} == {v.t})', 1, False))
+                self.run(it.get('stmt'), b_and(pc, b_and(b_not(prev), m)), st)
+                prev = b_or(prev, m)
+            self.run(n.get('defaultCase'), b_and(pc, b_not(prev)), st)
+        elif k in ('ForLoop', 'RepeatLoop', 'WhileLoop'):
+            self.run_loop(n, pc, st)
+        else:
+            raise Unsupported(f'function body: statement {k}')
+
+    def run_loop(self, n, pc, st):
+        k = n['k']
+        if k == 'RepeatLoop':
+            c = self.scalar(n['count'])
+            if c.k is None: raise Unsupported('function body: repeat count not constant')
+            for _ in range(min(c.k.v, self.LOOP_MAX)): self.run(n.get('body'), pc, st)
+            return
+        for init in n.get('initializers') or []:     # for (i = 0; ...) on a declared local
+            self.step_expr(init, pc, st)
+        for i in range(self.LOOP_MAX + 1):
+            stop = n.get('stopExpr') if k == 'ForLoop' else n.get('cond')
+            if stop is not None:
+                c = self.boolean(self.scalar(stop))
+                if c.k is None: raise Unsupported('function body: loop condition not constant')
+                if not c.k.v: return
+            if i == self.LOOP_MAX: raise Unsupported(f'function body: more than {self.LOOP_MAX} iterations')
+            self.run(n.get('body'), pc, st)
+            for e in n.get('steps') or []: self.step_expr(e, TRUE, FnState(st.ret, FALSE))
+
+
+class FnState:
+    """symbolic execution of a function body: the return value so far and whether a return has run"""
+    def __init__(self, ret, done):
+        self.ret, self.done = ret, done
+
+
+TRUE = S("1'b1", 1, False, K(1, 1))
+FALSE = S("1'b0", 1, False, K(0, 1))
+
+
+def b_and(a, b):
+    if a.k is not None: return b if a.k.v else FALSE
+    if b.k is not None: return a if b.k.v else FALSE
+    return S(f'({a.t} && {b.t})', 1, False)
+
+
+def b_or(a, b):
+    if a.k is not None: return TRUE if a.k.v else b
+    if b.k is not None: return TRUE if b.k.v else a
+    return S(f'({a.t} || {b.t})', 1, False)
+
+
+def b_not(a):
+    if a.k is not None: return FALSE if a.k.v else TRUE
+    return S(f'(!{a.t})', 1, False)
+
+
+def mux(c, a, b):
+    if c.k is not None: return a if c.k.v else b
+    if a.t == b.t: return a
+    return S(f'({c.t} ? {a.t} : {b.t})', a.w, a.s)
 
 
 def kconst(v, w, s):
@@ -902,6 +1222,8 @@ class ObjResolver:
         if isinstance(x, Arr):
             tx.refs.add(x.name)
             return ARef(x)
+        if isinstance(x, ObjArr): return ARef(x)
+        if isinstance(x, Assoc): return AssocRef(x)
         return ORef(x)
 
     def member(self, base, n, tx):
@@ -914,7 +1236,7 @@ class ObjResolver:
 
 # ======================================================================== generator
 def sev_key(cls_name):
-    return re.sub(r'#.*$', '', cls_name.split('::')[-1])
+    return re.sub(r'#.*$', '', cls_name).split('::')[-1]     # parameters first: item_cls#(drv::T)
 
 
 class Gen:
@@ -977,12 +1299,14 @@ class Gen:
                     break
         for s in cands:
             body = s.get('body')
+            if body is None or s.get('kind') != 'Function': continue
+            if any(a.get('dir') not in (None, 'In') for a in s.get('args', [])): continue     # output/ref args
             r = single_return(body)
-            if r is None: continue
             formals = []
             for a in s.get('args', []):
                 formals.append({'name': a['name'], 'path': f"{s['path']}.{a['name']}", 'default_ast': None})
-            return r, formals, s['path']
+            # a single `return e;` is substituted; any other body is executed symbolically
+            return (r if r is not None else {'k': '#body', 'body': body}), formals, s['path']
         return None
 
     def max_size(self, cls_chain_objs, prop_name):
@@ -995,6 +1319,57 @@ class Gen:
                     hi = size_bound(it['expr'], prop_name)
                     if hi is not None: best = hi if best is None else min(best, hi)
         return best
+
+    def items_of(self, chain):
+        for c in chain:
+            for b in c['constraints']:
+                for it in b['items']: yield it
+        yield from getattr(self, 'extra_items', [])          # inline constraints of the site being built
+
+    def max_inner_size(self, chain, prop, depth):
+        """upper bound of prop[i]..size() (`depth` selects) from unconditional constraints, also inside foreach"""
+        best = None
+        def walk(it):
+            nonlocal best
+            k = it.get('k')
+            if k == 'List':
+                for x in it.get('list') or []: walk(x)
+            elif k == 'Foreach':
+                walk(it['body'])
+            elif k == 'Expression' and not it.get('isSoft'):
+                hi = size_bound(it['expr'], prop, depth)
+                if hi is not None: best = hi if best is None else min(best, hi)
+        for c in chain:
+            for b in c['constraints']:
+                for it in b['items']: walk(it)
+        return best
+
+    def size_constrained(self, chain, prop):
+        """LRM 18.4: does any constraint (class or the call site's inline ones) read prop.size()?"""
+        def has(x):
+            if isinstance(x, dict):
+                if x.get('k') == 'Call' and x.get('subroutineName') in ('size', 'num') and x.get('arguments') and \
+                        strip_conv(x['arguments'][0]).get('symbol', {}).get('sym') == prop:
+                    return True
+                return any(has(v) for v in x.values())
+            if isinstance(x, list): return any(has(v) for v in x)
+            return False
+        return any(has(it) for it in self.items_of(chain))
+
+    def assoc_keys(self, chain, prop):
+        """constant keys prop[...] is read with in the constraints"""
+        keys = set()
+        def walk(x):
+            if isinstance(x, dict):
+                if x.get('k') == 'ElementSelect' and strip_conv(x.get('value') or {}).get('symbol', {}).get('sym') == prop:
+                    sel = strip_conv(x.get('selector') or {})
+                    if 'const' in sel: keys.add(str(parse_const(sel['const']).v) if not str(sel['const']).startswith('"')
+                                                else sel['const'])
+                for v in x.values(): walk(v)
+            elif isinstance(x, list):
+                for v in x: walk(v)
+        for it in self.items_of(chain): walk(it)
+        return keys
 
     def build_obj(self, mod, cls, prefix, role, origin, depth=0, notes=None):
         """flatten a class's fields into model variables: rand fields get `role`, others 'state'
@@ -1014,7 +1389,7 @@ class Gen:
                     notes.append(f"{p['name']}: randc modelled as rand (cyclic order across calls is not "
                                  "modelled; approx: over)")
                 x = self.make_var(mod, prefix + p['name'], p.get('ti') or {}, role,
-                                  f"{c['name']}.{p['name']}", depth, notes, chain, p)
+                                  f"{origin}.{p['name']}", depth, notes, chain, p)
                 if x is not None: obj.kids[p['name']] = x
         return obj
 
@@ -1027,19 +1402,30 @@ class Gen:
             return v
         if k in ('FixedSizeUnpackedArrayType', 'DynamicArrayType', 'QueueType'):
             dims, t = [], ti
-            dyn = False
+            dyn, inner_dyn, dtrunc = False, [], set()
+            cap = self.a.max_array
+            trunc = False
             while t.get('kind') in ('FixedSizeUnpackedArrayType', 'DynamicArrayType', 'QueueType'):
                 if t['kind'] == 'FixedSizeUnpackedArrayType':
                     dims.append(tuple(t['range']))
+                elif dims:      # inner dynamic dimension: up to --max-array elements per outer position
+                    inner_dyn.append(len(dims))
+                    imx = self.max_inner_size(chain, prop['name'], len(dims)) if chain and prop is not None else None
+                    if imx is not None and imx <= cap:
+                        dims.append((0, max(imx - 1, 0)))
+                        t = t.get('elem') or {}
+                        continue
+                    dims.append((0, cap - 1))
+                    dtrunc.add(len(dims) - 1)
+                    if notes is not None:
+                        notes.append(f'{origin}: inner dynamic dimension {len(dims)} modelled up to {cap} elements per '
+                                     'outer element; constraints reading a whole inner array hold only while its size() '
+                                     f'<= {cap} (approx: over; raise --max-array)')
                 else:
-                    if dims:
-                        if notes is not None: notes.append(f'{origin}: dynamic inner array dimension not modelled')
-                        return None
                     dyn = True
                     mx = None
                     if chain and prop is not None:
                         mx = self.max_size(chain, prop['name'])
-                    cap = self.a.max_array
                     trunc = mx is None or mx > cap
                     if trunc and notes is not None:
                         notes.append(f'{origin}: size() ' + ('unbounded by unconditional constraints'
@@ -1050,18 +1436,68 @@ class Gen:
                     if trunc: mx = cap
                     dims.append((0, max(mx - 1, 0)))
                 t = t.get('elem') or {}
-            if 'w' not in t:
+            # LRM 18.4: an unconstrained size() is not changed by randomize(): the size is then state
+            srole = role if (role != 'rand' or not chain or prop is None or self.size_constrained(chain, prop['name'])) \
+                else 'state'
+            sv = Var(ident(name + '__size'), 32, True, srole, origin + '.size()') if dyn else None
+            if sv is not None: sv.arr_kind = ti['kind']
+            if 'w' in t:
+                arr = Arr(ident(name), dims, t['w'], t.get('signed', False), role, origin, ti, sv, t.get('enum'))
+            elif t.get('kind') in ('ClassType', 'UnpackedStructType'):
+                arr = ObjArr(ident(name), dims, role, origin, sv)
+                for pos, idx in enumerate(iter_dims(dims)):
+                    eo = origin + ''.join(f'[{i + min(dims[k])}]' for k, i in enumerate(idx))
+                    e = self.make_var(mod, f'{name}__{pos}', t, role, eo, depth, notes, chain)
+                    if e is None: return None
+                    arr.kids[str(pos)] = e
+            else:
                 if notes is not None: notes.append(f'{origin}: array element type {t.get("kind")} not modelled')
                 return None
-            sv = Var(ident(name + '__size'), 32, True, role, origin + '.size()') if dyn else None
-            arr = Arr(ident(name), dims, t['w'], t.get('signed', False), role, origin, ti, sv,
-                      t.get('enum'))
             if dyn: arr.max, arr.trunc = dims[0][1] + 1, trunc
+            arr.dtrunc = dtrunc
+            for d in inner_dyn:          # sizes of an inner dynamic dimension: one per outer position
+                nout = math.prod(abs(a - b) + 1 for a, b in dims[:d])
+                sa = Arr(ident(f'{name}__size{d}'), [(0, nout - 1)], 32, True, role, f'{origin} dim {d + 1} size()')
+                sa.max = abs(dims[d][0] - dims[d][1]) + 1
+                sa.size_of = (arr, d)
+                tk = ti
+                for _ in range(d): tk = tk.get('elem') or {}
+                sa.arr_kind = tk.get('kind')
+                arr.dsize[d] = sa
             return arr
+        if k == 'AssociativeArrayType':
+            t = ti.get('elem') or {}
+            a = Assoc(ident(name), role, origin, ti.get('index') or {})
+            iw = (ti.get('index') or {}).get('w')
+            for key in sorted(self.assoc_keys(chain, prop['name']) if chain and prop is not None else []):
+                kv = parse_const(key) if not key.startswith('"') else None
+                e = self.make_var(mod, f'{name}__k_{key}', t, role, f'{origin}[{key}]', depth, notes, chain)
+                if e is None: return None
+                a.keys[key] = (kv, e)
+                a.kids['k:' + key] = e
+                if isinstance(e, Var): e.arr_kind = 'AssocKey'
+            for i in range(self.a.max_array):
+                kv = Var(ident(f'{name}__s{i}_key'), iw, (ti.get('index') or {}).get('signed', False), 'state',
+                         f'{origin} slot {i} key') if iw else None
+                vv = Var(ident(f'{name}__s{i}_valid'), 1, False, 'state', f'{origin} slot {i} present')
+                e = self.make_var(mod, f'{name}__s{i}', t, role, f'{origin}[slot {i}]', depth, notes, chain)
+                if e is None: return None
+                a.slots.append((kv, vv, e))
+                slot = Obj(None, f'{name}__s{i}__', 'state', f'{origin} slot {i}')
+                if kv is not None: slot.kids['key'] = kv
+                slot.kids['valid'], slot.kids['val'] = vv, e
+                a.kids[f's{i}'] = slot
+            if notes is not None:
+                notes.append(f'{origin}: associative array: elements read with a constant key, plus {self.a.max_array} '
+                             'symbolic entries (key and presence are state, LRM 18.4) for foreach / size(); keys of '
+                             'different entries are not forced distinct (approx: over)')
+            return a
         if k == 'UnpackedStructType':
             o = Obj(None, name + '__', role, origin)
             for f in ti.get('fields', []):
-                x = self.make_var(mod, name + '__' + f['name'], f['type'], role, origin + '.' + f['name'],
+                # LRM 18.4: a member of a rand unpacked struct is random only when declared rand/randc
+                frole = role if role != 'rand' or f.get('rand') in ('Rand', 'RandC') or 'rand' not in f else 'state'
+                x = self.make_var(mod, name + '__' + f['name'], f['type'], frole, origin + '.' + f['name'],
                                   depth, notes)
                 if x is not None: o.kids[f['name']] = x
             return o
@@ -1122,6 +1558,7 @@ class Gen:
             for b in c['constraints']:
                 if b['name'] in seen: continue
                 seen.add(b['name'])
+                if b.get('pure'): continue      # 18.5.2: a pure prototype; a derived class supplies the block
                 out.append((c, b))
         return list(reversed(out))
 
@@ -1134,7 +1571,11 @@ class Gen:
         mod = Module(mname, 'constraints', f"constraints of class {cls['name']} ({cls['file']}:{cls['start']})"
                      + (f"; randomize() at {site['where']}: {site['src']}" if site else ''))
         notes = []
+        mod.sv_map = {}          # port -> [(lsb, width, SV path of the field / element)] (report: port_map)
+        inl = (site or {}).get('inline')
+        self.extra_items = (inl.get('list', []) if inl.get('k') == 'List' else [inl]) if inl else []
         root = self.build_obj(mod, cls, '', 'rand', cls['name'], 0, notes)
+        self.extra_items = []
         mod.cls, mod.site, mod.root = cls, site, root
         rand_filter = site.get('args') if site else None
         cm_mode, rand_mode = self.modes(chain, site)
@@ -1144,11 +1585,19 @@ class Gen:
         tx = Tx(mod, res, self)
 
         def gather(o, prefix_obj):
-            """(object, constraint items) for the object and its nested rand objects"""
+            """(object, constraint items) for the object and its nested rand objects (also array elements:
+            an element of a dynamic array only while it exists)"""
             yield o
             for x in o.kids.values():
                 if isinstance(x, Obj) and getattr(x, 'nested_rand', False):
                     yield from gather(x, o)
+                elif isinstance(x, ObjArr):
+                    inner = x.n // (abs(x.dims[0][0] - x.dims[0][1]) + 1)
+                    for pk, e in x.kids.items():
+                        if not pk.isdigit() or not getattr(e, 'nested_rand', False): continue
+                        if x.size_var is not None:
+                            e.exists = (f'({lit(int(pk) // inner, 32, True)} < {x.size_var.name})', {x.size_var.name}, True)
+                        yield from gather(e, o)
 
         blocks = []
         for o in gather(root, None):
@@ -1167,6 +1616,7 @@ class Gen:
             sub_res = res if o is root else ObjResolver(self, mod, o, o.chain)
             sub_res.cls_objs = self.chain(o.cls)
             sub_tx = tx if o is root else Tx(mod, sub_res, self)
+            sub_tx.base_guards = [o.exists] if getattr(o, 'exists', None) else []
             for i, it in enumerate(b['items']):
                 ent = {'kind': 'constraint', 'class': cls['name'], 'block': b['name'], 'defined_in': c['name'],
                        'item': i, 'file': b.get('body', b).get('file', b['file']) if isinstance(b.get('body'), dict) else b['file'],
@@ -1273,6 +1723,7 @@ class Gen:
                      ('rand ' if is_rand else 'state ') + v.origin +
                      (f' [{"][".join(f"{a}:{b}" for a, b in v.dims)}] x {v.ew}b' if isinstance(v, Arr) else ''))
             v.is_rand = is_rand
+            mod.sv_map[v.name] = sv_slices(v)
         self.resolve_soft(mod, atoms)
         # assumes
         for a in atoms:
@@ -1446,7 +1897,7 @@ class Gen:
                 for m in tx.notes: note(m)
                 refs = set(tx.refs) | set().union(*[g[1] for g in guards] or [set()])
                 cond = e.t
-                if tx.trunc:
+                if tx.trunc or tx.trunc_extra:
                     note('reads a dynamic array past its modelled elements: holds only while size() <= '
                          'the model maximum (approx: over)')
                     cond = f'({tx.trunc_cond()} || {cond})'
@@ -1454,12 +1905,18 @@ class Gen:
                 if guards:
                     g = ' && '.join(x[0] for x in guards)
                     cond = f'(!({g}) || {cond})'
-                self.add_atom(atoms, ent, cond, refs, s, param, guard=g)
+                # the reachability check covers the testbench's own guards (if / ->), not the existence of
+                # array elements the model unrolls (foreach positions, associative entries)
+                ug = [x[0] for x in guards if not (len(x) > 2 and x[2])]
+                self.add_atom(atoms, ent, cond, refs, s, param, guard=' && '.join(ug) if ug else None)
             elif k == 'Implication':
                 tx.start()
                 try: p = tx.boolean(tx.scalar(n['predicate']))
                 except Unsupported as ex:
                     note(f"implication predicate not translated: {ex}; body omitted (approx: over)", 'unsupported')
+                    return
+                if p.k is not None:         # constant guard (18.5.12): the body applies or does not exist
+                    if p.k.v: walk(n['body'], guards, soft)
                     return
                 walk(n['body'], guards + [(trunc_guard(p.t), set(tx.refs))], soft)
             elif k == 'Conditional':
@@ -1470,6 +1927,10 @@ class Gen:
                     return
                 r = set(tx.refs)
                 tc = tx.trunc_cond()
+                if p.k is not None and not tc:      # constant guard (18.5.12): only the taken branch exists
+                    if p.k.v: walk(n['ifBody'], guards, soft)
+                    elif n.get('elseBody'): walk(n['elseBody'], guards, soft)
+                    return
                 walk(n['ifBody'], guards + [(trunc_guard(p.t), r)], soft)
                 if n.get('elseBody'):
                     walk(n['elseBody'], guards + [(f'(!({tc}) && !{p.t})' if tc else f'!{p.t}', r)], soft)
@@ -1493,6 +1954,8 @@ class Gen:
                         try: walk(n['body'], guards, soft)
                         finally: tx.env.pop(lv['path'], None)
                     return
+                if isinstance(a, AssocRef):
+                    self.foreach_assoc(tx, n, a.assoc, guards, soft, walk, note); return
                 if not isinstance(a, ARef):
                     note('foreach over a non-array; omitted (approx: over)', 'unsupported'); return
                 dims = n.get('loopDims') or []
@@ -1534,7 +1997,7 @@ class Gen:
             else:
                 note(f'constraint kind {k} not translated; omitted (approx: over)', 'unsupported')
 
-        walk(it, [], False)
+        walk(it, list(getattr(tx, 'base_guards', [])), False)
         if it['k'] == 'Expression' and strip_conv(it.get('expr', {})).get('k') == 'Dist':
             note('dist: weights only shape the distribution; the legal set (non-zero weights) is assumed', 'info')
         # soft items: kept or dropped (and the status) is decided by resolve_soft
@@ -1544,29 +2007,71 @@ class Gen:
         if notes: ent.setdefault('notes', []).extend(notes)
         ent['n_atoms'] = len(atoms) - n0
 
-    def unroll(self, tx, n, a, dims, d, guards, soft, walk, note):
+    def unroll(self, tx, n, a, dims, d, guards, soft, walk, note, pos=None):
         if d >= len(dims):
             walk(n['body'], guards, soft); return
         dim = dims[d]
         lv = dim.get('loopVar')
         arr = a.arr
-        l, r = arr.dims[a.depth + d] if a.depth + d < len(arr.dims) else (0, -1)
+        depth = a.depth + d
+        if pos is None:
+            try: pos = eval_int(str(a.pos))
+            except Exception: pos = None
+        l, r = arr.dims[depth] if depth < len(arr.dims) else (0, -1)
         rng = dim.get('range')
-        if rng and isinstance(rng, dict) and 'left' in rng:
+        if rng and isinstance(rng, dict) and 'left' in rng and depth not in arr.dsize:
             l, r = rng['left'], rng['right']
         idxs = range(min(l, r), max(l, r) + 1)
+        size = abs(l - r) + 1
         for i in idxs:
             g = list(guards)
-            if d == 0 and a.depth == 0 and arr.size_var is not None:
-                g = g + [(f"({lit(i, 32, True)} < {arr.size_var.name})", {arr.size_var.name})]
+            if depth == 0 and arr.size_var is not None:
+                g = g + [(f"({lit(i, 32, True)} < {arr.size_var.name})", {arr.size_var.name}, True)]
+            elif depth in arr.dsize:
+                if pos is None:
+                    note('foreach over an inner dynamic dimension of a variably indexed array; omitted (approx: over)',
+                         'unsupported'); return
+                sa = arr.dsize[depth]
+                g = g + [(f"({lit(i, 32, True)} < {sa.name}[{pos * 32} +: 32])", {sa.name}, True)]
+            npos = None if pos is None else pos * size + (i - min(l, r))
             if lv is None:          # skipped dimension: foreach (a[, j])
-                self.unroll(tx, n, a, dims, d + 1, g, soft, walk, note); continue
+                self.unroll(tx, n, a, dims, d + 1, g, soft, walk, note, npos); continue
             key = lv.get('path')
             tx.env[key] = S(lit(i, 32, True), 32, True, K(i, 32, True))
             try:
-                self.unroll(tx, n, a, dims, d + 1, g, soft, walk, note)
+                self.unroll(tx, n, a, dims, d + 1, g, soft, walk, note, npos)
             finally:
                 tx.env.pop(key, None)
+
+    def foreach_assoc(self, tx, n, assoc, guards, soft, walk, note):
+        """foreach (aa[k]): every element read with a constant key, and every symbolic entry (when present)"""
+        dims = n.get('loopDims') or []
+        if len(dims) != 1:
+            note('foreach over an associative array with more than one loop variable; omitted (approx: over)', 'unsupported')
+            return
+        lv = dims[0].get('loopVar')
+        key = lv.get('path') if lv else None
+        iw = assoc.index_ti.get('w')
+        isg = bool(assoc.index_ti.get('signed'))
+
+        def bind(kval):
+            if key is None: return
+            if kval is None:
+                tx.env.pop(key, None)       # a string key: using it as a value is unsupported (unbound name)
+            else:
+                tx.env[key] = kval
+        try:
+            for ktext, (kv, e) in sorted(assoc.keys.items()):
+                bind(S(lit(kv.v, iw, isg), iw, isg, K(kv.v, iw, isg)) if kv is not None and iw else None)
+                tx.env['#assoc:' + assoc.name] = ktext
+                walk(n['body'], guards, soft)
+            for i, (kvar, vv, e) in enumerate(assoc.slots):
+                bind(S(kvar.name, kvar.w, kvar.signed, None, not kvar.signed) if kvar is not None else None)
+                tx.env['#assoc:' + assoc.name] = i
+                walk(n['body'], guards + [(vv.name, {vv.name} | ({kvar.name} if kvar is not None else set()), True)], soft)
+        finally:
+            if key is not None: tx.env.pop(key, None)
+            tx.env.pop('#assoc:' + assoc.name, None)
 
     def build_randomizer(self, cm, cls, site=None):
         """fv_r_: object fields as registers; `randomize` loads anyseq values that satisfy the
@@ -1585,7 +2090,7 @@ class Gen:
             if c.startswith('rand '):
                 mod.port('output', decl, nm, c)
                 nxt = mod.names('nxt_' + nm)
-                body.append(f'  (* anyseq *) {decl.replace(" " + nm, " " + nxt)};')
+                body.append(f"  (* anyseq *) {renamed(decl, nm, nxt)};")
                 init = self.init_of(cm.root, nm)
                 body.append(f'  initial {nm} = {init};' if init else f"  initial {nm} = '0;")
                 body.append(f'  always_ff @(posedge clk) if (randomize) {nm} <= {nxt};')
@@ -1616,10 +2121,11 @@ class Gen:
     def mode_calls(self, routine, receiver, before=None):
         """constraint_mode()/rand_mode() setter calls of a routine on `receiver`, in source order"""
         out = []
-        for c in (routine or {}).get('facts', {}).get('calls', []):
+        for c in (routine or {}).get('facts', {}).get('calls', []):     # calls are in source order
+            if before is not None and ((c.get('line') or 0) > before or
+                                       c.get('name') == 'randomize' and c.get('line') == before): break
             if c.get('name') not in ('constraint_mode', 'rand_mode') or c.get('value') is None: continue
             if c.get('receiver') != receiver: continue
-            if before is not None and (c.get('line') or 0) >= before: continue
             try: on = parse_const(c['value']).v != 0
             except Exception: continue
             out.append((c['name'], c.get('member'), on, f"{c['src']} ({routine.get('file')}:{c.get('line')})"))
@@ -1661,19 +2167,20 @@ class Gen:
             args = ast.get('arguments') or []
             where = f"{r.get('owner')}::{r.get('subroutine') or r.get('procedure')} {r['file']}:{r['line']}"
             tag = ident(f"{r.get('subroutine') or r.get('procedure') or 'p'}_L{r['line']}")
+            encl = self.class_at(r['file'], r['line'])
+            if r['kind'] == 'randomize' and r.get('target') == 'this' and encl is None and not self.cls(r.get('owner')):
+                r = dict(r, kind='std::randomize')      # randomize(v..) outside a class: scope randomization (18.12)
             if r['kind'] == 'std::randomize':
                 out.append({'kind': 'std', 'cls': None, 'inline': inline, 'args': args, 'where': where,
                             'tag': tag, 'file': r['file'], 'src': r['src'], 'owner': r.get('owner')})
                 continue
             tgt_cls = None
             names = []
-            encl = self.class_at(r['file'], r['line'])
-            if r.get('target') == 'this' or not args or (args and args[0].get('k') != 'NamedValue' and
-                                                          args[0].get('k') != 'MemberAccess'):
+            if r.get('target') == 'this' or not args:
                 tgt_cls = encl or self.cls(r.get('owner'))
                 names = [strip_conv(a).get('symbol', {}).get('sym') for a in args if a.get('k') != 'EmptyArgument']
             else:
-                tgt_cls = self.cls(args[0].get('ty', ''), encl['path'] if encl else None)
+                tgt_cls = self.cls(args[0].get('cty') or args[0].get('ty', ''), encl['path'] if encl else None)
                 names = [strip_conv(a).get('symbol', {}).get('sym') for a in args[1:]]
                 # `obj.randomize(x)`: slang lists the target first
             if r.get('target') == 'this':
@@ -1955,10 +2462,32 @@ def en_of(a):
 
 def leaves(o):
     if isinstance(o, (Var, Arr)):
-        yield o; return
+        yield o
+        if isinstance(o, Arr): yield from o.dsize.values()
+        return
     for x in o.kids.values():
-        if isinstance(x, (Var, Arr)): yield x
+        if isinstance(x, (Var, Arr)): yield from leaves(x)
         elif isinstance(x, Obj): yield from leaves(x)
+    if isinstance(o, ObjArr): yield from o.dsize.values()
+
+
+def sv_slices(v):
+    """(lsb, width, SV path) of each field / element a model variable holds; paths start with the class
+    name (origin), array elements carry their indices, sizes read `.size()`"""
+    role = 'rand' if getattr(v, 'is_rand', v.role == 'rand') else 'state'
+    if isinstance(v, Var):
+        return [(0, v.w, v.origin, role, getattr(v, 'arr_kind', None))]
+    out = []
+    of = getattr(v, 'size_of', None)
+    for p, idx in enumerate(iter_dims(v.dims)):
+        if of is not None:      # sizes of an inner dynamic dimension: outer position -> arr[i]..size()
+            arr, d = of
+            oidx = list(iter_dims(arr.dims[:d]))[p]
+            path = arr.origin + ''.join(f'[{i + min(arr.dims[k])}]' for k, i in enumerate(oidx)) + '.size()'
+        else:
+            path = v.origin + ''.join(f'[{i + min(v.dims[k])}]' for k, i in enumerate(idx))
+        out.append((p * v.ew, v.ew, path, role, getattr(v, 'arr_kind', None) if of is not None else None))
+    return out
 
 
 def leaves_any(o):
@@ -1979,19 +2508,24 @@ def single_return(body):
     return None
 
 
-def size_bound(e, prop):
-    """upper bound on prop.size() stated by expression e (<, <=, ==, inside with constant bounds)"""
+def size_bound(e, prop, depth=0):
+    """upper bound on prop.size() (depth 0) or on prop[i]..[j].size() (depth = number of selects) stated
+    by expression e (<, <=, ==, inside with constant bounds)"""
     e = strip_conv(e)
     k = e.get('k')
 
     def is_size(x):
         x = strip_conv(x)
-        return (x.get('k') == 'Call' and x.get('subroutineName') in ('size', 'num') and x.get('arguments')
-                and strip_conv(x['arguments'][0]).get('symbol', {}).get('sym') == prop)
+        if not (x.get('k') == 'Call' and x.get('subroutineName') in ('size', 'num') and x.get('arguments')): return False
+        a = strip_conv(x['arguments'][0])
+        for _ in range(depth):
+            if a.get('k') != 'ElementSelect': return False
+            a = strip_conv(a['value'])
+        return a.get('k') != 'ElementSelect' and a.get('symbol', {}).get('sym') == prop
     if k == 'BinaryOp':
         op = e['op']
         if op == 'LogicalAnd':
-            a, b = size_bound(e['left'], prop), size_bound(e['right'], prop)
+            a, b = size_bound(e['left'], prop, depth), size_bound(e['right'], prop, depth)
             return min(x for x in (a, b) if x is not None) if a is not None or b is not None else None
         l, r = e['left'], e['right']
         kr, kl = nconst(r) or nconst(strip_conv(r)), nconst(l) or nconst(strip_conv(l))
@@ -3965,9 +4499,11 @@ def summarize(gen):
     return {'source': gen.a.json,
             'atom_order': {cm.name: [{'wire': a['wire'], 'block': a['entry'].get('block'), 'item': a['entry'].get('item'),
                                       'class': a['entry'].get('class'), 'guard': a.get('guard'), 'kind': a['kind'],
-                                      'soft': a['soft']}
+                                      'soft': a['soft'], 'param': a.get('param'),
+                                      'enabled': dict((p[0], p[1]) for p in cm.params).get(a.get('param'), "1'b1") != "1'b0"}
                                      for a in cm.atom_order] for cm, _ in gen.mods_c},
             'hit_order': {m.name: m.hit_order for m in gen.mods_cg},
+            'port_map': {cm.name: getattr(cm, 'sv_map', {}) for cm, _ in gen.mods_c},
             'modules': {'constraints': [cm.name for cm, _ in gen.mods_c],
                         'randomizers': [rm.name for _, rm in gen.mods_c if rm is not None],
                         'covergroups': [m.name for m in gen.mods_cg]},
