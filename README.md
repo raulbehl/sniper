@@ -250,6 +250,27 @@ logic only they used. A design that still uses both clock edges runs in multiclo
 at the rising edge, as a clocked driver drives them). Not yet: the testbench drivers' behaviour as
 input constraints.
 
+### Formal tools: `--formal-tool yosys | jasper | vcf`
+
+The cover jobs (smoke runs, `--rtl`) run on yosys + yosys-smtbmc by default; `fvtools.py` also has JasperGold
+(`jg -batch -tcl`) and VC Formal (`vcf -batch -f`) backends (`[fvgen] formal_tool = "jasper"` in a `flow.py`
+project). The generated SV is the same for every tool: `fv_tool.svh` and the copied `prim_assert.sv` switch on
+`FV_SVA`, which the commercial scripts define:
+
+- assumptions, covers and the illegal-bin asserts become concurrent SVA (`assume/cover/assert property`;
+  yosys keeps its immediate forms);
+- `` `FV_ANYSEQ `` (yosys `(* anyseq *)`) is empty, and the script frees each such signal by hierarchical name
+  (`stopat -env` / `snip_driver`), found by scanning the job's generated code;
+- with `--rtl` the tool reads the RTL filelists and bind modules itself (with their SVA: every assumption in
+  them applies, the interface-only selection is a yosys/svalower step), DUT probes are SV hierarchical
+  references, and a design using both clock edges gets a both-edges clock.
+
+Each script prints `FVCOVER <status> <trace length> <property>` per cover, which fvgen parses. Not yet:
+`--witness` with a commercial tool (it reads yosys-smtbmc's VCD traces). The commercial backends follow the
+tools' documented Tcl commands and have not been run yet; `tests/test_fvtools.py` runs them end to end
+against stand-in executables (script contents, free-signal names, result parsing) and lints the `FV_SVA`
+form of every job.
+
 ### `svalower.py`: concurrent SVA for yosys-slang
 
 ```sh

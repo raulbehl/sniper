@@ -149,6 +149,7 @@ fv_constraints.sv
 miter.sv
 prim_assert.sv
 prim_assert_yosys_macros.svh
+fv_tool.svh
 ''')
     r = run(['sby', '-f', 'eq.sby'], cwd=out, check=False)
     log = r.stdout + r.stderr
@@ -525,7 +526,7 @@ def test_regressions():
     assert [h for h in hits if h.startswith('cov_cp_n__')] == [f'cov_cp_n__b__{i}' for i in range(4)]
     cg = module_text(V, 'fv_cg_cov_c__cg')
     assert "cp_n__b__1 = sample && 1'b1 && ((cp_cp_n >= 32'h40000000 && cp_cp_n <= 32'h7fffffff))" in cg
-    assert 'cov_cp_n__b__0: cover (' in cg                      # labelled covers keep the bin name
+    assert '`FV_COVER(cov_cp_n__b__0, ' in cg                  # labelled covers keep the bin name (fv_tool.svh)
     assert not any(l.lstrip().startswith(('y ', 'y\t')) for l in cg.splitlines())
 
     # cross with-filtered ignore/illegal bins: wholly excluded products are not bins, partly
