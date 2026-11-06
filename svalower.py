@@ -368,7 +368,7 @@ def original_range(sm, rng):
     return s, e
 
 
-def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
+def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None, unguard=()):
     d = pyslang.driver.Driver()
     d.addStandardArgs()
     if not d.parseCommandLine('slang ' + ' '.join(slang_args), pyslang.driver.CommandLineOptions()):
@@ -396,11 +396,11 @@ def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
         # default clocking / disable iff: applied to the lowered assertions; yosys-slang rejects them
         for dc in iter_kind(tree.root, (SK.DefaultDisableDeclaration,)):
             s, e = original_range(sm, dc.sourceRange)
-            edits.setdefault(sm.getFileName(s), {})[(s.offset, e.offset)] = '  // svalower: default disable iff applied'
+            edits.setdefault(os.path.abspath(sm.getFileName(s)), {})[(s.offset, e.offset)] = '  // svalower: default disable iff applied'
         for dc in iter_kind(tree.root, (SK.ClockingDeclaration,)):
             if txt(dc.globalOrDefault) != 'default': continue
             s, e = original_range(sm, dc.sourceRange)
-            edits.setdefault(sm.getFileName(s), {})[(s.offset, e.offset)] = '  // svalower: default clocking applied'
+            edits.setdefault(os.path.abspath(sm.getFileName(s)), {})[(s.offset, e.offset)] = '  // svalower: default clocking applied'
         # a flop with an asynchronous load and no clocked branch (`if (!rst_n) q <= 0;`): yosys-slang
         # needs the if-else shape; an empty else keeps the meaning (hold)
         for ff in iter_kind(tree.root, (SK.AlwaysFFBlock, SK.AlwaysBlock)):
@@ -412,10 +412,10 @@ def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
             if getattr(body, 'kind', None) == SK.ConditionalStatement and body.elseClause is None:
                 s, e = original_range(sm, body.sourceRange)
                 if sm.isMacroLoc(body.sourceRange.start): continue
-                edits.setdefault(sm.getFileName(s), {})[(e.offset, e.offset)] = ' else begin end'
+                edits.setdefault(os.path.abspath(sm.getFileName(s)), {})[(e.offset, e.offset)] = ' else begin end'
         for dc in decls:                    # inlined where used; yosys-slang rejects the declarations
             s, e = original_range(sm, dc.sourceRange)
-            edits.setdefault(sm.getFileName(s), {})[(s.offset, e.offset)] = \
+            edits.setdefault(os.path.abspath(sm.getFileName(s)), {})[(s.offset, e.offset)] = \
                 f'  // svalower: {"sequence" if dc.kind == SK.SequenceDeclaration else "property"} ' \
                 f'{str(dc.name).strip()} inlined where it is used'
         for st in stmts:
@@ -423,7 +423,7 @@ def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
             lab = st.label
             label = lab.name.valueText if lab is not None else None       # without comment trivia
             s, e = original_range(sm, st.sourceRange)
-            path = sm.getFileName(s)
+            path = os.path.abspath(sm.getFileName(s))
             line = sm.getLineNumber(s)
             if not label: label = f'sva_{os.path.basename(path).split(".")[0]}_{line}'
             label = re.sub(r'\W', '_', label)
@@ -446,6 +446,8 @@ def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
                            'why': why, 'src': txt(st)[:200]})
             edits.setdefault(path, {})[(s.offset, e.offset)] = text
     files = {}
+    unguard = {os.path.abspath(x) for x in unguard}
+    for path in unguard: edits.setdefault(path, {})
     for path, eds in edits.items():
         src = open(path).read()
         # nested macro expansions can map several statements to one call: keep the widest edit
@@ -456,6 +458,11 @@ def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
             else: kept[-1] = (kept[-1][0], kept[-1][1] + '\n' + t)
         for (a, b), t in sorted(kept, key=lambda kv: -kv[0][0]):
             src = src[:a] + t + src[b:]
+        if os.path.abspath(path) in unguard:
+            # a checker read next to synthesizable RTL: its `ifndef SYNTHESIS content is wanted, the RTL's
+            # simulation-only code is not; SYNTHESIS is lifted for this file only
+            src = ('`ifdef SYNTHESIS\n  `define SVALOWER_SYNTHESIS\n  `undef SYNTHESIS\n`endif\n' + src +
+                   '\n`ifdef SVALOWER_SYNTHESIS\n  `define SYNTHESIS\n  `undef SVALOWER_SYNTHESIS\n`endif\n')
         dst = os.path.join(out_dir, 'src', os.path.basename(path))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         with open(dst, 'w') as f: f.write(src)
@@ -464,7 +471,8 @@ def run(slang_args, out_dir, kinds=('assert', 'assume', 'cover'), keep=None):
 
 
 def flatten_args(args, base=None):
-    """expand -f files into a flat argument list (paths made absolute)"""
+    """expand -f files into a flat argument list (paths made absolute; $VAR / ${VAR} from the
+    environment, as slang does)"""
     out, i = [], 0
     while i < len(args):
         a = args[i]
@@ -472,7 +480,7 @@ def flatten_args(args, base=None):
             fn = args[i + 1] if os.path.isabs(args[i + 1]) or base is None else os.path.join(base, args[i + 1])
             toks = []
             for line in open(fn):
-                line = line.split('//')[0].strip()
+                line = os.path.expandvars(line.split('//')[0]).strip()
                 if line: toks += line.split()
             out += flatten_args(toks, os.path.dirname(os.path.abspath(fn)))
             i += 2; continue
@@ -486,14 +494,14 @@ def flatten_args(args, base=None):
     return out
 
 
-def lower_filelists(filelists, out_dir, defines=(), kinds=('assert', 'assume', 'cover'), keep=None):
+def lower_filelists(filelists, out_dir, defines=(), kinds=('assert', 'assume', 'cover'), keep=None, unguard=()):
     """lowered copy of the sources named by slang argument files: (path of the new flat filelist,
     report). Properties of other kinds than `kinds` are left out of the copies."""
     out_dir = os.path.abspath(out_dir)      # callers run tools from other directories
     args = []
     for f in filelists: args += flatten_args(['-f', os.path.abspath(f)])
     args += [f'+define+{x}' for x in defines]
-    files, report = run(args, out_dir, kinds, keep)
+    files, report = run(args, out_dir, kinds, keep, unguard)
     flat = [files.get(a, a) for a in args]
     fl = os.path.join(out_dir, 'lowered.f')
     with open(fl, 'w') as f: f.write('\n'.join(flat) + '\n')

@@ -1,0 +1,23 @@
+# flow.py project: the ibex instruction cache UVM testbench, its covergroups on the ibex_icache RTL.
+#
+#   export IBEX=<ibex checkout> UVM=<UVM 1.2 / uvm-core checkout>
+#   python flow.py examples/ibex_icache/flow.toml -o icache_out
+#
+# Paths are relative to this file; ${VAR} comes from the environment (also inside the .f files).
+
+[testbench]                       # sniper: what the simulator compiles
+own  = ["${IBEX}/dv/uvm/icache/dv"]          # the testbench's own sources (reported in detail)
+args = ["--single-unit", "+define+UVM", "-f", "uvm.f", "-f", "tb.f", "--top", "tb"]
+
+[fvgen]                           # any fvgen option by name
+run     = true                    # smoke-check constraints and covers with all inputs free
+witness = true                    # replay classes (fv_replay.sv): hit a chosen bin in simulation
+jobs    = 8
+
+[rtl]                             # the covergroups on the DUT (keys of examples/rtl_config.toml)
+top       = "ibex_icache"
+filelists = ["rtl.f"]
+clock     = "clk_i"
+reset     = "rst_ni"
+reset_active_low = true
+depth     = 30

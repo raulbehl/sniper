@@ -27,6 +27,39 @@ so copy it there and run from the TB directory:
     +incdir+$UVM/src $UVM/src/uvm_pkg.sv -f sniper.f        # UVM: a UVM library checkout
 ```
 
+## The whole flow: `flow.py`
+
+One project file per testbench runs sniper, then fvgen (smoke runs, witness replay, the RTL run),
+and prints each command before it runs it, so any step can be rerun by hand:
+
+```sh
+export IBEX=~/work/sniper_corpus/ibex UVM=~/work/sniper_corpus/uvm-core
+python flow.py examples/ibex_icache/flow.toml -o icache_out        # --steps fvgen: reuse tb.json
+open icache_out/fv/report.md
+```
+
+```toml
+[testbench]                     # sniper: what the simulator compiles
+own  = ["${IBEX}/dv/uvm/icache/dv"]
+args = ["--single-unit", "+define+UVM", "-f", "uvm.f", "-f", "tb.f", "--top", "tb"]
+
+[fvgen]                         # any fvgen option by name
+run     = true
+witness = true
+
+[rtl]                           # optional: the keys of an --rtl-config file, or config = "x.toml"
+top       = "ibex_icache"
+filelists = ["rtl.f"]
+clock     = "clk_i"
+reset     = "rst_ni"
+reset_active_low = true
+depth     = 30
+```
+
+Paths are relative to the project file and `${VAR}` comes from the environment, also inside the `.f`
+files, so a project can sit next to (or away from) the sources it reads. Outputs: `OUT/tb.json`,
+`OUT/fv/` (`report.md`, `fv_*.sv`, `fv_replay.sv`, ...). `--dry-run` prints the commands only.
+
 ## Tests
 
 ```sh
@@ -39,6 +72,39 @@ bins/crosses, assertions, randomization sites, stimulus map, config overrides an
 (widths/signedness, struct offsets, `type_info`, transition steps, option values, functions called
 from constraints, `constraint_mode`/`rand_mode` calls), `probe_invalid.sv` code slang cannot bind.
 Every extraction bug found on the corpus gets an assertion there.
+
+### LRM conformance: `tests/test_lrm.py`
+
+```sh
+python tests/test_lrm.py            # clause 18: constraints
+python tests/test_lrm.py 19         # clause 19: coverage
+SNIPER_REF_SIM=vcs python tests/test_lrm.py      # reference simulator: verilator (default) | vcs | xcelium | questa
+```
+
+- **Clause 18** (`tests/lrm_constraints.sv`): one class per construct (expressions and widths, implication,
+  if/else, inside, dist, unique, foreach incl. skipped dimensions, dynamic / nested dynamic / associative
+  arrays, arrays of objects and structs, reductions, `item.index`, `find().size()`, functions with locals /
+  case / loops, inheritance, extern / pure constraints, nested rand objects, enums, unpacked struct members,
+  guards on state and null handles, system functions, `solve before`, static constraints, soft priorities,
+  `disable soft`, inline `with` and `local::`, `randomize(a)`, `rand_mode` / `constraint_mode`). Every class
+  has `check()`: the LRM meaning of its constraints in plain procedural SV. For value tuples (the solver's
+  solutions, their one-field mutations, random tuples) fvgen's checker must agree with `check()`; the
+  reference simulator's solver is compared too, and its deviations from `check()` are listed (Verilator 5.052
+  deviates on unique, enum domains, dist, find, element-class constraints, unpacked struct members, variable
+  bit-selects, function locals, associative keys).
+- **Clause 19** (`tests/lrm_coverage.sv`): the worked examples of 1800-2023 as written (19.5.1 bins and fixed
+  arrays, default arrays, 19.5.1.1 `with`, 19.5.2 transitions on the LRM's sample traces, 19.5.3 automatic
+  bins, 19.5.4 wildcards, 19.5.5/19.5.6 ignore/illegal, 19.5.7 value resolution, 19.6 crosses and select
+  expressions, iff). fvgen's covers are driven with every value / the traces / value pairs and compared with
+  the bins the text states. `L19_KNOWN` lists where fvgen deliberately differs from the text, with the reason
+  (one today: `[=]` followed by a value, where the example's count disagrees with the meaning of `[=]` in
+  sequences; reachability is the same).
+- `tests/refsim.py`: the reference simulator backends. The commercial ones follow the tools' documented
+  command lines and have not been run yet.
+
+Not modelled (reported as unsupported): real-valued coverpoints and tolerance ranges (no real arithmetic in
+the formal model), `default sequence` bins (outside coverage per the LRM), cross bins from functions
+returning `CrossQueueType`.
 
 ## Output
 
@@ -154,11 +220,14 @@ objects are taken as true). `--covergroups REGEX` limits the run.
 ### Covergroups on the RTL: `--rtl`
 
 ```sh
-python fvgen.py tb.json -o fv/ --rtl rtl.f --rtl-top uart [--rtl-depth 40]
+python fvgen.py tb.json -o fv/ --rtl-config rtl_config.toml
 ```
 
-`rtl.f` holds the slang arguments of the DUT RTL (read with yosys-slang). fvgen builds a formal top
-with the DUT (inputs free, the reset port held for three cycles) and runs each covergroup whose
+The RTL setup comes from the user, in a TOML file (template: `examples/rtl_config.toml`; paths relative
+to it; `--rtl-*` options override its entries): `top` (the DUT module), `filelists` (slang `-f` files
+of the RTL, read with yosys-slang), `clock`, `reset`, `reset_active_low`, and optionally `binds` /
+`bind_tops` (the testbench's bind modules and checkers), `defines`, `depth`. fvgen builds a formal top
+with the DUT (inputs free, the reset held for three cycles) and runs each covergroup whose
 inputs it can trace into the design, sampled every cycle, so a bin is reached when the design ever
 holds that value. Inputs are traced from the extraction alone:
 
@@ -180,6 +249,27 @@ covers of the design and the checkers are left out (the runs are about reaching 
 logic only they used. A design that still uses both clock edges runs in multiclock mode (inputs change
 at the rising edge, as a clocked driver drives them). Not yet: the testbench drivers' behaviour as
 input constraints.
+
+### Formal tools: `--formal-tool yosys | jasper | vcf`
+
+The cover jobs (smoke runs, `--rtl`) run on yosys + yosys-smtbmc by default; `fvtools.py` also has JasperGold
+(`jg -batch -tcl`) and VC Formal (`vcf -batch -f`) backends (`[fvgen] formal_tool = "jasper"` in a `flow.py`
+project). The generated SV is the same for every tool: `fv_tool.svh` and the copied `prim_assert.sv` switch on
+`FV_SVA`, which the commercial scripts define:
+
+- assumptions, covers and the illegal-bin asserts become concurrent SVA (`assume/cover/assert property`;
+  yosys keeps its immediate forms);
+- `` `FV_ANYSEQ `` (yosys `(* anyseq *)`) is empty, and the script frees each such signal by hierarchical name
+  (`stopat -env` / `snip_driver`), found by scanning the job's generated code;
+- with `--rtl` the tool reads the RTL filelists and bind modules itself (with their SVA: every assumption in
+  them applies, the interface-only selection is a yosys/svalower step), DUT probes are SV hierarchical
+  references, and a design using both clock edges gets a both-edges clock.
+
+Each script prints `FVCOVER <status> <trace length> <property>` per cover, which fvgen parses. Not yet:
+`--witness` with a commercial tool (it reads yosys-smtbmc's VCD traces). The commercial backends follow the
+tools' documented Tcl commands and have not been run yet; `tests/test_fvtools.py` runs them end to end
+against stand-in executables (script contents, free-signal names, result parsing) and lints the `FV_SVA`
+form of every job.
 
 ### `svalower.py`: concurrent SVA for yosys-slang
 

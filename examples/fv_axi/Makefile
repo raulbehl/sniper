@@ -26,7 +26,7 @@ $(FV_JSON):
 fv: $(FV_JSON)
 	$(PYTHON) $(SNIPER)/fvgen.py $(FV_JSON) -o fv --prim-assert-dir $(PRIM)
 
-ALL_FILES = $(abspath $(DUT_FILES) $(FV_FILES) fv/prim_assert.sv fv/prim_assert_yosys_macros.svh)
+ALL_FILES = $(abspath $(DUT_FILES) $(FV_FILES) fv/prim_assert.sv fv/prim_assert_yosys_macros.svh fv/fv_tool.svh)
 
 # $(1) = cover | assert, $(2) = sby mode, $(3) = depth   (written like make.cfg's formal_build_*)
 define sby_build

@@ -149,6 +149,7 @@ fv_constraints.sv
 miter.sv
 prim_assert.sv
 prim_assert_yosys_macros.svh
+fv_tool.svh
 ''')
     r = run(['sby', '-f', 'eq.sby'], cwd=out, check=False)
     log = r.stdout + r.stderr
@@ -525,7 +526,7 @@ def test_regressions():
     assert [h for h in hits if h.startswith('cov_cp_n__')] == [f'cov_cp_n__b__{i}' for i in range(4)]
     cg = module_text(V, 'fv_cg_cov_c__cg')
     assert "cp_n__b__1 = sample && 1'b1 && ((cp_cp_n >= 32'h40000000 && cp_cp_n <= 32'h7fffffff))" in cg
-    assert 'cov_cp_n__b__0: cover (' in cg                      # labelled covers keep the bin name
+    assert '`FV_COVER(cov_cp_n__b__0, ' in cg                  # labelled covers keep the bin name (fv_tool.svh)
     assert not any(l.lstrip().startswith(('y ', 'y\t')) for l in cg.splitlines())
 
     # cross with-filtered ignore/illegal bins: wholly excluded products are not bins, partly
@@ -747,13 +748,35 @@ def test_rtl_covers():
     open(os.path.join(work, 'rtl.f'), 'w').write(os.path.join(HERE, 'rtl_dut.sv') + '\n')
     open(os.path.join(work, 'bind.f'), 'w').write(os.path.join(HERE, 'rtl_chk.sv') + '\n' +
                                                  os.path.join(HERE, 'rtl_bind.sv') + '\n')
-    run([PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl', 'rtl.f', '--rtl-bind', 'bind.f',
-         '--rtl-top', 'rf_dut', '--rtl-depth', '14'], cwd=work)
+    # the RTL setup comes from the user: a config file (paths relative to it)
+    os.makedirs(os.path.join(work, 'cfg'))
+    cfg = '''top = "rf_dut"
+filelists = ["../rtl.f"]
+binds = ["../bind.f"]
+bind_tops = ["rf_bind"]
+clock = "clk_i"
+reset = "rst_ni"
+reset_active_low = true
+depth = 14
+'''
+    open(os.path.join(work, 'cfg', 'rtl.toml'), 'w').write(cfg)
+    fv = [PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv', '--rtl-config', 'cfg/rtl.toml']
+    run(fv, cwd=work)
+    # what it needs is checked, with the DUT's ports when a name is wrong
+    open(os.path.join(work, 'cfg', 'bad.toml'), 'w').write(cfg.replace('reset = "rst_ni"\n', ''))
+    err = [PY, os.path.join(ROOT, 'fvgen.py'), js, '-o', 'fv_err', '--rtl-config']
+    r = run(err + ['cfg/bad.toml'], cwd=work, check=False)
+    assert r.returncode and 'needs reset' in r.stderr, r.stderr
+    assert not os.path.exists(os.path.join(work, 'fv_err')), 'nothing is written before the config is checked'
+    r = run(err + ['cfg/rtl.toml', '--rtl-clock', 'clk'], cwd=work, check=False)
+    assert r.returncode and 'clk not an input port of rf_dut' in r.stderr and 'clk_i' in r.stderr, r.stderr
     rep = json.load(open(os.path.join(work, 'fv', 'report.json')))
     info = rep['rtl_info']
     assert (info['instance'], info['clock'], info['reset'], info['reset_active_low']) == \
-        ('rf_tb.dut', ['clk_i'], 'rst_ni', True)
-    src = {m: {p: (x['source'] or [None])[0:2] for p, x in mp.items()} for m, mp in info['maps'].items()}
+        ('rf_tb.dut', ['clk_i'], ['rst_ni'], True)
+    # one instance per covergroup here: its mapping
+    src = {m: {p: (x['source'] or [None])[0:2] for p, x in next(iter(insts.values())).items()}
+           for m, insts in info['maps'].items()}
     assert src['fv_cg_rf_cov__lvl_cg'] == {'lvl': ['port', 'level_o']}         # rif.level = lvl = level_o
     assert src['fv_cg_rf_cov__busy_cg'] == {'b': ['net', 'busy']}              # rif.busy = dut.busy
     assert src['fv_cg_rf_cov__mode_cg'] == {'m': ['net', 'cfg_q']}             # register model HDL path
@@ -769,12 +792,47 @@ def test_rtl_covers():
     assert rows['cov_cp_mode__auto_3']['status'] == 'unreached'
     assert (rows['cov_cp_busy__auto_0'].get('step'), rows['cov_cp_busy__auto_1'].get('step')) == (4, 5)
     assert rows['cov_cp_x__one']['status'] == 'unmapped'
+    # one covergroup type, two instances on different sources: per-instance results (the level reaches 8,
+    # the 2-bit config register never does)
+    hi = {(r['instance'], r['cover']): r['status'] for r in rep['rtl'] if r['covergroup'].endswith('__hi_cg')}
+    assert hi == {('lvl_hi', 'cov_cp_v__hi'): 'reached', ('lvl_hi', 'cov_cp_v__low'): 'reached',
+                  ('cfg_hi', 'cov_cp_v__hi'): 'unreached', ('cfg_hi', 'cov_cp_v__low'): 'reached'}, hi
+    # a whole register read: its fields at their offsets (cfg_q never 3 under the assumption)
+    assert (rows['cov_cp_r__two']['status'], rows['cov_cp_r__three']['status']) == ('reached', 'unreached')
+    # a covergroup on a DUT input is reached by the free stimulus alone, and says so
+    assert src['fv_cg_rf_cov__wr_cg'] == {'w': ['port', 'wr_i']}
+    assert rows['cov_cp_wr__auto_1']['inputs_only'] and not rows['cov_cp_lvl__l__3']['inputs_only']
     # concurrent SVA: only the assumption is kept (it describes the interface); the design's and the
     # bound checker's assertions and covers are left out of the cover runs
     sva = {x['name']: x['status'] for x in info['sva']}
     assert sva == {'cfg_never_3_M': 'lowered', 'level_max_A': 'skipped', 'read_empty_A': 'skipped',
                    'fill_C': 'skipped', 'full_hold_A': 'skipped'}, sva
     assert info['tops'] == ['rf_dut', 'rf_bind'] and not info['multiclock']
+    # flow.py: the same run from one project file, ${VAR} from the environment (in the project file and
+    # inside the slang filelists); the same results
+    env = dict(os.environ, FVT5_SRC=HERE)
+    open(os.path.join(work, 'cfg', 'rtl_env.f'), 'w').write('${FVT5_SRC}/rtl_dut.sv\n')
+    proj = '''[testbench]
+own = ["${FVT5_SRC}"]
+args = ["--top", "rf_tb", "${FVT5_SRC}/rtl_dut.sv", "${FVT5_SRC}/rtl_tb.sv"]
+[rtl]
+top = "rf_dut"
+filelists = ["rtl_env.f"]
+binds = ["../bind.f"]
+bind_tops = ["rf_bind"]
+clock = "clk_i"
+reset = "rst_ni"
+reset_active_low = true
+depth = 14
+'''
+    open(os.path.join(work, 'cfg', 'flow.toml'), 'w').write(proj)
+    flow = [PY, os.path.join(ROOT, 'flow.py'), 'cfg/flow.toml', '-o', 'flow']
+    r = subprocess.run(flow, cwd=work, capture_output=True, text=True, env=env)
+    assert not r.returncode, r.stdout[-3000:] + r.stderr[-3000:]
+    res = lambda rp: {(x['instance'], x['covergroup'], x['cover']): (x['status'], x.get('step')) for x in rp['rtl']}
+    assert res(json.load(open(os.path.join(work, 'flow', 'fv', 'report.json')))) == res(rep)
+    r = subprocess.run(flow + ['--dry-run'], cwd=work, capture_output=True, text=True)   # FVT5_SRC unset
+    assert r.returncode and 'FVT5_SRC is not set' in r.stderr, r.stderr
     shutil.rmtree(work, ignore_errors=True)
     return len(rows)
 

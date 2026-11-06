@@ -209,7 +209,8 @@ def test_rtl_mapping_extraction():
     assert blk['regs'] == {'cfg': {'class': 'rf_pkg::rf_reg_cfg',
                                    'slices': [{'path': 'cfg_q', 'offset': 0, 'size': 2, 'kind': 'RTL'}]}}
     tb = next(h for h in d['hierarchy'] if h['name'] == 'rf_tb')
-    assert [(a['lhs'], a['rhs']) for a in tb['assigns']] == [('rif.level', 'lvl'), ('rif.busy', 'dut.busy')]
+    assert [(a['lhs'], a['rhs']) for a in tb['assigns']] == [('rif.level', 'lvl'), ('rif.busy', 'dut.busy'),
+                                                             ('rif.wr', 'wr')]
 
 
 def test_invalid_code():
