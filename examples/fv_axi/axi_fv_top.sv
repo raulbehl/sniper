@@ -39,10 +39,19 @@ module axi_fv_top (
     else if (ready) valid <= 1'b0;
   end
 
-  // ---------------------------------------------------------------- DUT, AXI side free
-  (* anyseq *) logic aw_ready, w_ready, b_valid, ar_ready, r_valid, r_last, rsp_ready;
+  // ---------------------------------------------------------------- DUT, AXI side
+  // FV_AXI_DRIVER: the UVM testbench's axi_slave_driver as RTL (axi_slave_driver_fv.sv); otherwise every
+  // AXI input is free
+  (* anyseq *) logic rsp_ready;
+`ifdef FV_AXI_DRIVER
+  logic aw_ready, w_ready, b_valid, ar_ready, r_valid, r_last;
+  logic [2:0] b_id, r_id;
+  logic [31:0] r_data;
+`else
+  (* anyseq *) logic aw_ready, w_ready, b_valid, ar_ready, r_valid, r_last;
   (* anyseq *) logic [2:0] b_id, r_id;
   (* anyseq *) logic [31:0] r_data;
+`endif
   logic        aw_valid, w_valid, w_last, b_ready, ar_valid, r_ready, rsp_valid;
   logic [2:0]  aw_id, ar_id;
   logic [31:0] aw_addr, ar_addr, w_data;
@@ -50,6 +59,16 @@ module axi_fv_top (
   logic [2:0]  aw_size, ar_size;
   logic [3:0]  w_strb, rsp_id;
   logic [127:0] rsp_data;
+`ifdef FV_AXI_DRIVER
+  logic drv_q_overflow;
+  axi_slave_driver_fv #(.QDEPTH(8)) u_axi_drv (
+    .clk, .reset_n(!reset),
+    .arvalid(ar_valid), .arid(ar_id), .arlen(ar_len), .awvalid(aw_valid), .awid(aw_id),
+    .wvalid(w_valid), .wlast(w_last), .rready(r_ready), .bready(b_ready),
+    .arready(ar_ready), .awready(aw_ready), .wready(w_ready), .rvalid(r_valid), .rid(r_id), .rdata(r_data),
+    .rlast(r_last), .bvalid(b_valid), .bid(b_id), .q_overflow(drv_q_overflow));
+  `ASSERT(drv_queue_fits, !drv_q_overflow)           // the model's request queues are deep enough
+`endif
 
   axi_master DUT (
     .clk, .reset_n(!reset),
@@ -76,4 +95,17 @@ module axi_fv_top (
   `COVER(axi_partial_strobe, w_valid && w_ready && w_strb != 4'hf && w_strb != 4'h0)
   `COVER(axi_write_last, w_valid && w_ready && w_last)
   `COVER(axi_read_issued, ar_valid && ar_ready)
+  // the AXI responses come back to the DUT and on to the CPU side
+  logic ar_seen = 1'b0, aw_seen = 1'b0;
+  always_ff @(posedge clk) begin
+    if (ar_valid && ar_ready) ar_seen <= 1'b1;
+    if (aw_valid && aw_ready) aw_seen <= 1'b1;
+  end
+  `COVER(axi_read_data_beat, r_valid && r_ready)
+  `COVER(axi_write_response, b_valid && b_ready)
+  `COVER(cpu_read_response, rsp_valid && rsp_ready)
+  // behaviours the UVM testbench never produces: a read beat with no AR issued, a write response with no
+  // write issued. Reachable with free AXI inputs; with FV_AXI_DRIVER they must be unreachable
+  `COVER(spurious_r_beat, r_valid && r_ready && !ar_seen)
+  `COVER(spurious_b_resp, b_valid && b_ready && !aw_seen)
 endmodule
