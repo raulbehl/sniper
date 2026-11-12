@@ -58,7 +58,17 @@ formal_assert: formal_build_assert
 
 formal: formal_cover formal_assert
 
-clean:
-	rm -rf fv formal_cover formal_assert formal_cover.sby formal_assert.sby $(FV_JSON)
+# The same covers with the UVM testbench's AXI slave modelled (axi_slave_driver_fv.sv) instead of free AXI
+# inputs. Everything goes through read_slang (the top instantiates the model with parameters); free values
+# ((* anyseq *) / FV_ANYSEQ) are then undriven wires, made free before prep.
+formal_cover_drv:
+	@printf '%s\n' '[options]' 'mode cover' 'depth $(COVER_DEPTH)' '[engines]' 'smtbmc' '[script]' 'plugin -i slang' \
+	  'read_slang -U SYNTHESIS -DFORMAL -DFV_AXI_DRIVER $(notdir $(DUT_FILES)) axi_slave_driver_fv.sv $(notdir $(FV_FILES)) --top axi_fv_top' \
+	  'hierarchy -top axi_fv_top' 'proc' 'setundef -undriven -anyseq' 'prep -top axi_fv_top' '[files]' > formal_cover_drv.sby
+	@printf '%s\n' $(ALL_FILES) $(abspath axi_slave_driver_fv.sv fv/fv_sva_macros.svh) >> formal_cover_drv.sby
+	sby -f formal_cover_drv.sby
 
-.PHONY: fv formal formal_cover formal_assert formal_build_cover formal_build_assert clean
+clean:
+	rm -rf fv formal_cover formal_assert formal_cover_drv formal_cover.sby formal_assert.sby formal_cover_drv.sby $(FV_JSON)
+
+.PHONY: fv formal formal_cover formal_cover_drv formal_assert formal_build_cover formal_build_assert clean
