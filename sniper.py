@@ -326,6 +326,7 @@ class Ser:
                 vt = n.symbol.type
                 if vt.isIntegral: out['w'], out['signed'] = vt.bitWidth, bool(vt.isSigned)
                 out['ty'] = str(vt)
+                out['ti'] = type_info(vt)
                 if n.symbol.initializer is not None: out['init'] = self._node(n.symbol.initializer, False, seen)
             except Exception: pass
         for a in sorted(set(dir(type(n))) - BASE_ATTRS[base] - SKIP):
@@ -1063,9 +1064,10 @@ class Extractor:
         ent = {'name': s.name, 'owner': owner_cls['name'] if owner_cls else owner, 'path': path,
                'owner_is_class': owner_cls is not None, 'kind': enum_name(s.subroutineKind),
                'virtual': s.isVirtual, **sp, 'macro_generated': 'macro' in sp,
-               'returns': str(s.returnType),
-               'args': [{'name': a.name, 'dir': enum_name(a.direction), 'type': str(a.type),
-                         'default': text(a.defaultValue) if getattr(a, 'defaultValue', None) is not None else None}
+               'returns': str(s.returnType), 'ret_ti': type_info(s.returnType),
+               'args': [{'name': a.name, 'dir': enum_name(a.direction), 'type': str(a.type), 'ti': type_info(a.type),
+                         'default': text(a.defaultValue) if getattr(a, 'defaultValue', None) is not None else None,
+                         'default_ast': self.ser.node(a.defaultValue) if getattr(a, 'defaultValue', None) is not None else None}
                         for a in s.arguments]}
         if uninstantiated(s):
             ent['uninstantiated'] = True

@@ -88,3 +88,40 @@ Known limits of the model:
 - **Queue depth:** the UVM queues are unbounded; `QDEPTH` entries are modelled, and the `drv_queue_fits`
   assertion checks they suffice.
 - **Configuration:** one `cfg` per run, given as parameters.
+
+## Coverage closure: the whole UVM test as RTL, short replayable runs per bin
+
+`fvgen --agent <test>` (fvproc.py) turns a UVM test -- both agents, the test's sequence, the monitors -- into one
+RTL model: a state machine per testbench process (a state per wait, counters for `repeat (n) @(posedge clk)`,
+registers for what a process keeps across edges), every `$urandom_range` / `randomize()` a free value inside
+the testbench's own ranges and constraints. `axi_cov_top.sv` puts it around the DUT with a cover per
+`axi_coverage` bin (the testbench counts them in string-keyed arrays, so the bins are written out once here),
+plus a few deeper events (`env_*`: a read response, a write response, four requests, the DUT's read buffer full).
+
+```
+python3 cover_closure.py -o cc_rw --test axi_rw_rand_test            # model, cover search, replay files
+python3 cover_closure.py -o cc_bp --test axi_backpressure_test --replay   # ... and replay them in Verilator
+python3 cover_closure.py -o cc_jg --test axi_backpressure_test --formal-tool jasper   # Tcl for JasperGold (or vcf)
+```
+
+The models are built once for every test (`fvgen --agent-tests`, in `fv_tests/` next to the output): the
+constants a test's own code supplies (`run_rand(60, 0)`, `seq.addr = 'h10`) and the cfg fields its `configure()`
+sets are parameters, so tests that differ only in those share a model -- here 10 tests are 5 models, the six
+`run_rand` tests one (`fv_tests.json`: test -> model, parameter values). `--test` picks the model and values.
+
+- `cc_*/closure.md`: per trace, the bins it reaches and at which edge (all 52 bins within 9-23 cycles)
+- `cc_*/fv_replay.sv`: `<class>__fv_replay extends <class>` for every class that makes a random choice (the
+  drivers, the sequences, `mem_req_item`), applied by the package itself when `+FV_REPLAY=<trace>.replay` is
+  given. Compile it with the testbench and run the test unchanged: `+UVM_TESTNAME=<test> +FV_REPLAY=cov_7.replay`
+- `driver_check/replay_check.py` (`--replay`): replays every trace and compares both buses with the formal
+  trace at every edge up to the cover. A trace that does not replay is a modelling error, not a result.
+
+The generated models are two-state (`bit`), as the testbench's types: an out-of-range read is 0 in every
+tool. yosys-slang gives x there instead, so the yosys flow maps x to 0 (`setundef -zero`) after freeing the
+`FV_ANYSEQ` choices. The Jasper / VC Formal scripts free the same choices (`stopat -env` / `snip_driver`) and
+follow fvtools.py's backends; they have not been run here (no license).
+
+Results (Verilator, uvm-core 2020): `axi_rw_rand_test` 52/52 bins, `axi_backpressure_test` 52/52 bins plus the
+read buffer full at edge 21; every trace replays cycle-exactly. `driver_check/rdbuf_mon.sv` (bound into the
+DUT) counts read-buffer-full cycles in simulation: only `axi_backpressure_test` ever fills it (2 of 3 seeds),
+because the other tests keep `mem_cpu_ready` high and the buffer drains at once.

@@ -4718,6 +4718,14 @@ def main():
     ap.add_argument('--no-rtl-sva', dest='rtl_sva', action='store_false',
                     help='do not lower the concurrent SVA assumptions (svalower); yosys-slang then drops them')
     ap.add_argument('--keep', action='store_true', help='keep the smoke sby job directories and their traces')
+    ap.add_argument('--agent', action='append', help='UVM agent class: its driver / monitor / sequence processes as '
+                    'an RTL state-machine model, fv_agent_<agent>.sv (repeatable; see fvproc.py)')
+    ap.add_argument('--agent-tests', nargs='?', const='.', default=None, metavar='REGEX',
+                    help='every uvm_test (name matching REGEX) as a model; tests that differ only in parameters share '
+                         'one: fv_tests_g<k>.sv and fv_tests.json (test -> model, parameter values)')
+    ap.add_argument('--agent-qdepth', type=int, default=8, help='entries modelled for a queue / channel of an agent')
+    ap.add_argument('--agent-sync', type=int, default=2, help='passes per edge of a driver and its sequence')
+    ap.add_argument('--agent-cnt-w', type=int, default=8, help='width of repeat (n) @(posedge clk) counters')
     a = ap.parse_args()
     if a.rtl_config or a.rtl: load_rtl_config(a)      # before anything is written
     if a.formal_tool != 'yosys' and a.witness:
@@ -4728,6 +4736,18 @@ def main():
     gen.tool = fvtools.get(a.formal_tool)
     gen.run()
     rep = write_outputs(gen, a.out)
+    for ag in a.agent or []:
+        import fvproc
+        path, arep = fvproc.generate(d, ag, a.out, {'qdepth': a.agent_qdepth, 'sync': a.agent_sync,
+                                                    'cnt_w': a.agent_cnt_w})
+        print(f'{path}: {len(arep["processes"])} processes, {len(arep["free_choices"])} free choices, '
+              f'{len(arep["approximations"])} approximations, {len(arep["unsupported"])} unsupported')
+    if a.agent_tests is not None:
+        import fvproc
+        idx = fvproc.generate_tests(d, a.out, {'qdepth': a.agent_qdepth, 'sync': a.agent_sync, 'cnt_w': a.agent_cnt_w},
+                                    a.agent_tests)
+        print(f'tests: {len(idx["tests"])} tests in {len(idx["groups"])} models'
+              + (f', {len(idx["failed"])} not modelled: {", ".join(idx["failed"])}' if idx['failed'] else ''))
     if a.run:
         res = run_jobs(gen, gen.smokes, a.jobs)
         # guards reachable in a class's own module: dead at a call site only because of its inline
